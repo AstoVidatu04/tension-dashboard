@@ -1,6 +1,4 @@
 ---
-
----
 title: USA–Iran Tension Dashboard
 emoji: 🌍
 colorFrom: blue
@@ -9,6 +7,11 @@ sdk: streamlit
 app_file: streamlit_app.py
 pinned: false
 ---
+
+# 🇺🇸🇮🇷 USA–Iran Tension Dashboard
+
+A transparent indicator built from public news signals (GDELT).  
+Not a literal probability-of-war predictor.
 
 # 🇺🇸🇮🇷 USA–Iran Tension Dashboard
 
