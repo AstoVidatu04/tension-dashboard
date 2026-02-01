@@ -8,7 +8,6 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import requests
-from requests.auth import HTTPBasicAuth
 import streamlit as st
 
 
@@ -60,6 +59,7 @@ def empty_articles_df() -> pd.DataFrame:
 def parse_any_datetime(value: object) -> Optional[datetime]:
     if value is None:
         return None
+
     s = str(value).strip()
     if not s:
         return None
@@ -81,18 +81,17 @@ def parse_any_datetime(value: object) -> Optional[datetime]:
 
 def get_secret(key: str) -> str:
     """
-    Reads from Streamlit Secrets first, then env vars as fallback.
+    Streamlit Secrets first, env var fallback.
     """
     if key in st.secrets:
         return str(st.secrets[key])
-    v = st.session_state.get(key) or None
-    if v:
-        return str(v)
+
     import os
     v = os.environ.get(key)
     if v:
         return v
-    raise RuntimeError(f"Missing secret: {key}. Add it to Streamlit Secrets.")
+
+    raise RuntimeError(f"Missing secret: {key}. Add it in Streamlit Secrets.")
 
 
 # =============================
@@ -294,9 +293,10 @@ def compute_score(
 
 
 # =============================
-# OpenSky (safe aggregated view)
+# OpenSky OAuth2 (aggregated-only)
 # =============================
 OPENSKY_STATES_URL = "https://opensky-network.org/api/states/all"
+OPENSKY_TOKEN_URL = "https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token"
 
 
 def empty_states_df() -> pd.DataFrame:
@@ -309,24 +309,61 @@ def empty_states_df() -> pd.DataFrame:
     )
 
 
-@st.cache_data(ttl=10 * 60, show_spinner=False)  # 10 min cache to be polite
-def fetch_opensky_states(cache_key: str) -> Tuple[pd.DataFrame, str]:
+@st.cache_data(ttl=50 * 60, show_spinner=False)
+def fetch_opensky_token(cache_key: str) -> Tuple[Optional[str], str]:
     """
-    Fetch a snapshot of current airborne states from OpenSky.
-    Returns (df, status_message).
+    OAuth2 client-credentials flow.
     """
     try:
-        user = get_secret("OPENSKY_USERNAME")
-        pw = get_secret("OPENSKY_PASSWORD")
+        client_id = get_secret("OPENSKY_CLIENT_ID")
+        client_secret = get_secret("OPENSKY_CLIENT_SECRET")
     except Exception as e:
-        return empty_states_df(), f"OpenSky secrets missing: {e}"
+        return None, f"OpenSky OAuth secrets missing: {e}"
+
+    try:
+        r = requests.post(
+            OPENSKY_TOKEN_URL,
+            data={
+                "grant_type": "client_credentials",
+                "client_id": client_id,
+                "client_secret": client_secret,
+            },
+            timeout=30,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+    except requests.RequestException as e:
+        return None, f"OpenSky token request network error: {e}"
+
+    if r.status_code != 200:
+        snippet = (r.text or "")[:220].replace("\n", " ").strip()
+        return None, f"OpenSky token HTTP {r.status_code}. Snippet: {snippet}"
+
+    try:
+        js = r.json()
+    except ValueError:
+        return None, "OpenSky token endpoint returned non-JSON."
+
+    token = js.get("access_token")
+    if not token:
+        return None, "OpenSky token response missing access_token."
+
+    return token, "OpenSky token acquired."
+
+
+@st.cache_data(ttl=10 * 60, show_spinner=False)
+def fetch_opensky_states(cache_key: str) -> Tuple[pd.DataFrame, str]:
+    token, msg = fetch_opensky_token("token-" + cache_key)
+    if not token:
+        return empty_states_df(), msg
 
     try:
         r = requests.get(
             OPENSKY_STATES_URL,
-            auth=HTTPBasicAuth(user, pw),
             timeout=30,
-            headers={"User-Agent": "tension-dashboard/1.0"},
+            headers={
+                "Authorization": f"Bearer {token}",
+                "User-Agent": "tension-dashboard/1.0",
+            },
         )
     except requests.RequestException as e:
         return empty_states_df(), f"OpenSky network error: {e}"
@@ -344,9 +381,6 @@ def fetch_opensky_states(cache_key: str) -> Tuple[pd.DataFrame, str]:
     if not states:
         return empty_states_df(), "OpenSky returned 0 states."
 
-    # OpenSky states vector indices (subset)
-    # 0 icao24, 1 callsign, 2 origin_country, 3 time_position, 4 last_contact, 5 lon, 6 lat,
-    # 7 baro_altitude, 8 on_ground, 9 velocity, 10 heading, 11 vertical_rate, 13 geo_altitude
     rows = []
     for s in states:
         if not isinstance(s, list) or len(s) < 14:
@@ -373,34 +407,32 @@ def fetch_opensky_states(cache_key: str) -> Tuple[pd.DataFrame, str]:
     if df.empty:
         return empty_states_df(), "OpenSky returned states but none were parseable."
 
-    # Safety: we will not display icao24/callsign lists by default; only aggregates.
-    return df, f"OpenSky snapshot loaded: {len(df)} states."
+    return df, f"{msg} OpenSky snapshot loaded: {len(df)} states."
 
 
 def render_opensky_aggregates(states_df: pd.DataFrame):
     st.subheader("Flight activity (OpenSky) — aggregated snapshot")
-    st.caption("This view shows **aggregated** counts from a live snapshot (no per-aircraft listing by default).")
+    st.caption("Counts only (analysis view). No per-aircraft tracking list is shown by default.")
 
     if states_df.empty:
         st.info("No OpenSky data available right now.")
         return
 
-    # Derive a simple status label
     sdf = states_df.copy()
     sdf["air_status"] = np.where(sdf["on_ground"] == True, "on_ground", "airborne")
-    # Callsign “prefix” grouping (first 3 chars) can approximate operators without showing full IDs
     sdf["callsign_prefix"] = sdf["callsign"].fillna("").astype(str).str.strip().str[:3].replace("", "UNK")
 
-    # Generic keyword filter (user-supplied) applied to callsign ONLY, aggregated afterward.
-    # This avoids hardcoding “military types” and keeps it user-driven & non-targeted.
     with st.expander("Optional filters (aggregated only)", expanded=False):
-        kw = st.text_input("Filter by callsign keyword (optional)", value="", help="Example: an airline code like 'DLH' or 'BAW'.")
+        kw = st.text_input(
+            "Filter by callsign keyword (optional)",
+            value="",
+            help="Example: an airline code like 'DLH' or 'BAW'.",
+        )
         show_prefix_table = st.checkbox("Show callsign prefix table (aggregated)", value=True)
 
     if kw.strip():
-        sdf = sdf[sdf["callsign"].str.contains(kw.strip(), case=False, na=False)]
+        sdf = sdf[sdf["callsign"].astype(str).str.contains(kw.strip(), case=False, na=False)]
 
-    # Country aggregation
     by_country = (
         sdf.groupby("origin_country")
         .size()
@@ -412,7 +444,6 @@ def render_opensky_aggregates(states_df: pd.DataFrame):
     st.plotly_chart(fig1, use_container_width=True)
     st.dataframe(by_country, use_container_width=True, hide_index=True)
 
-    # Airborne vs ground
     by_status = (
         sdf.groupby("air_status")
         .size()
@@ -423,7 +454,6 @@ def render_opensky_aggregates(states_df: pd.DataFrame):
     st.plotly_chart(fig2, use_container_width=True)
     st.dataframe(by_status, use_container_width=True, hide_index=True)
 
-    # Callsign prefix aggregate (can be useful for civilian airline traffic)
     if show_prefix_table:
         by_prefix = (
             sdf.groupby("callsign_prefix")
@@ -436,8 +466,6 @@ def render_opensky_aggregates(states_df: pd.DataFrame):
         st.plotly_chart(fig3, use_container_width=True)
         st.dataframe(by_prefix, use_container_width=True, hide_index=True)
 
-    st.caption("Tip: This is a single snapshot. For history, you’d store periodic snapshots and aggregate over time.")
-
 
 # =============================
 # UI
@@ -448,14 +476,14 @@ st.caption(
     "Not a literal probability-of-war predictor."
 )
 
-st.info(
-    "⏱️ To avoid GDELT rate limits, data is cached for **1 hour**. "
-    "Sliders update instantly using cached data. Use **Refresh now** only if needed."
-)
-
 tab1, tab2 = st.tabs(["Tension dashboard (GDELT)", "Flight activity (OpenSky)"])
 
 with tab1:
+    st.info(
+        "⏱️ To avoid GDELT rate limits, data is cached for **1 hour**. "
+        "Sliders update instantly using cached data. Use **Refresh now** only if needed."
+    )
+
     with st.sidebar:
         st.header("Query & window")
 
@@ -584,21 +612,20 @@ with tab1:
     with st.expander("Raw daily table"):
         st.dataframe(scored, use_container_width=True)
 
-
 with tab2:
     st.info(
-        "OpenSky data is shown as **aggregates** (counts) to keep this dashboard analysis-oriented. "
-        "No per-aircraft tracking view is provided here."
+        "OpenSky data is shown as **aggregated counts** (analysis view). "
+        "Snapshot is cached for 10 minutes."
     )
 
-    # simple refresh control for OpenSky snapshot
     colA, colB = st.columns([1, 2])
     with colA:
         opensky_refresh = st.button("Refresh OpenSky snapshot")
     with colB:
-        st.caption("Snapshot is cached for 10 minutes by default.")
+        st.caption("Tip: refresh only if needed.")
 
     opensky_cache_key = utc_now().strftime("%Y%m%d%H%M%S") if opensky_refresh else "stable"
+
     with st.spinner("Fetching OpenSky snapshot…"):
         states_df, msg = fetch_opensky_states(opensky_cache_key)
 
