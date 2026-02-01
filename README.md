@@ -13,10 +13,6 @@ pinned: false
 A transparent indicator built from public news signals (GDELT).  
 Not a literal probability-of-war predictor.
 
-# 🇺🇸🇮🇷 USA–Iran Tension Dashboard
-
-A transparent indicator built from public news signals (GDELT). Not a literal probability-of-war predictor.
-
 
 ```md
 # 🇺🇸🇮🇷 USA–Iran Tension Dashboard
