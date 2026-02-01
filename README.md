@@ -7,20 +7,17 @@ sdk: streamlit
 app_file: streamlit_app.py
 pinned: false
 ---
-
-# 🇺🇸🇮🇷 USA–Iran Tension Dashboard
-
-A transparent indicator built from public news signals (GDELT).  
+---
+A transparent indicator built from public news signals (GDELT).
 Not a literal probability-of-war predictor.
 
 
-```md
 # 🇺🇸🇮🇷 USA–Iran Tension Dashboard
 
 A lightweight, interactive dashboard that tracks **publicly observable tension signals** between the United States and Iran using global news data from the **GDELT Project**.
 
-⚠️ **Important:**  
-This is **not** a prediction model and **not** a probability-of-war calculator.  
+⚠️ **Important:**
+This is **not** a prediction model and **not** a probability-of-war calculator.
 It is an **indicator** meant to show trends, volume, and tone of publicly reported events.
 
 ---
@@ -29,7 +26,7 @@ It is an **indicator** meant to show trends, volume, and tone of publicly report
 
 The dashboard aggregates recent news articles and derives:
 
-- 📈 A **Tension / Risk Score (0–100)**  
+- 📈 A **Tension / Risk Score (0–100)**
 - 📊 Daily counts of:
   - Hostile signals
   - Military-related signals
