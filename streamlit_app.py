@@ -48,8 +48,17 @@ def zscore(series: pd.Series) -> pd.Series:
     return (s - float(s.mean())) / std
 
 
-def logistic_0_100(x: pd.Series) -> pd.Series:
-    return 100.0 * (1.0 / (1.0 + np.exp(-x)))
+def logistic_0_100(x: float) -> float:
+    return float(100.0 * (1.0 / (1.0 + math.exp(-x))))
+
+
+def logit_from_0_100(score_0_100: float) -> float:
+    """
+    Convert 0-100 score back to logit space so we can add extra signals.
+    """
+    eps = 1e-6
+    p = min(max(score_0_100 / 100.0, eps), 1.0 - eps)
+    return math.log(p / (1.0 - p))
 
 
 def empty_articles_df() -> pd.DataFrame:
@@ -80,9 +89,6 @@ def parse_any_datetime(value: object) -> Optional[datetime]:
 
 
 def get_secret(key: str) -> str:
-    """
-    Streamlit Secrets first, env var fallback.
-    """
     if key in st.secrets:
         return str(st.secrets[key])
 
@@ -287,33 +293,21 @@ def compute_score(
     d["z_diplomacy"] = zscore(d["diplomacy_sm"])
 
     raw = (w_hostile * d["z_hostile"]) + (w_military * d["z_military"]) - (w_diplomacy * d["z_diplomacy"])
-    d["score"] = logistic_0_100(raw)
+    # raw is a Series here, convert elementwise to 0-100
+    d["score"] = (100.0 * (1.0 / (1.0 + np.exp(-raw)))).astype(float)
 
     return d
 
 
 # =============================
-# OpenSky OAuth2 (aggregated-only)
+# OpenSky OAuth2 + Iran airspace aggregate
 # =============================
 OPENSKY_STATES_URL = "https://opensky-network.org/api/states/all"
 OPENSKY_TOKEN_URL = "https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token"
 
 
-def empty_states_df() -> pd.DataFrame:
-    return pd.DataFrame(
-        columns=[
-            "icao24", "callsign", "origin_country", "time_position", "last_contact",
-            "lon", "lat", "baro_altitude", "on_ground", "velocity", "heading",
-            "vertical_rate", "geo_altitude"
-        ]
-    )
-
-
 @st.cache_data(ttl=50 * 60, show_spinner=False)
 def fetch_opensky_token(cache_key: str) -> Tuple[Optional[str], str]:
-    """
-    OAuth2 client-credentials flow.
-    """
     try:
         client_id = get_secret("OPENSKY_CLIENT_ID")
         client_secret = get_secret("OPENSKY_CLIENT_SECRET")
@@ -351,217 +345,244 @@ def fetch_opensky_token(cache_key: str) -> Tuple[Optional[str], str]:
 
 
 @st.cache_data(ttl=10 * 60, show_spinner=False)
-def fetch_opensky_states(cache_key: str) -> Tuple[pd.DataFrame, str]:
+def fetch_opensky_states_bbox(
+    cache_key: str,
+    lamin: float,
+    lamax: float,
+    lomin: float,
+    lomax: float,
+) -> Tuple[int, str]:
+    """
+    Fetch ONE snapshot within a bounding box and return an aggregate count:
+    number of airborne state vectors in bbox.
+    Bounding box filtering is supported by /states/all via lamin/lamax/lomin/lomax. :contentReference[oaicite:1]{index=1}
+    """
     token, msg = fetch_opensky_token("token-" + cache_key)
     if not token:
-        return empty_states_df(), msg
+        return 0, msg
 
+    params = {"lamin": lamin, "lamax": lamax, "lomin": lomin, "lomax": lomax}
     try:
         r = requests.get(
             OPENSKY_STATES_URL,
+            params=params,
             timeout=30,
-            headers={
-                "Authorization": f"Bearer {token}",
-                "User-Agent": "tension-dashboard/1.0",
-            },
+            headers={"Authorization": f"Bearer {token}", "User-Agent": "tension-dashboard/1.0"},
         )
     except requests.RequestException as e:
-        return empty_states_df(), f"OpenSky network error: {e}"
+        return 0, f"OpenSky network error: {e}"
 
     if r.status_code != 200:
         snippet = (r.text or "")[:220].replace("\n", " ").strip()
-        return empty_states_df(), f"OpenSky HTTP {r.status_code}. Snippet: {snippet}"
+        return 0, f"OpenSky HTTP {r.status_code}. Snippet: {snippet}"
 
     try:
         js = r.json()
     except ValueError:
-        return empty_states_df(), "OpenSky returned non-JSON response."
+        return 0, "OpenSky returned non-JSON response."
 
     states = js.get("states") or []
     if not states:
-        return empty_states_df(), "OpenSky returned 0 states."
+        return 0, f"{msg} OpenSky returned 0 states in bbox."
 
-    rows = []
+    # count airborne only (on_ground == False at index 8)
+    airborne = 0
     for s in states:
-        if not isinstance(s, list) or len(s) < 14:
-            continue
-        rows.append(
-            {
-                "icao24": (s[0] or "").lower().strip(),
-                "callsign": (s[1] or "").strip(),
-                "origin_country": s[2] or "",
-                "time_position": s[3],
-                "last_contact": s[4],
-                "lon": s[5],
-                "lat": s[6],
-                "baro_altitude": s[7],
-                "on_ground": s[8],
-                "velocity": s[9],
-                "heading": s[10],
-                "vertical_rate": s[11],
-                "geo_altitude": s[13],
-            }
-        )
+        if isinstance(s, list) and len(s) > 8:
+            on_ground = s[8]
+            if on_ground is False:
+                airborne += 1
 
-    df = pd.DataFrame(rows)
+    return airborne, f"{msg} OpenSky bbox snapshot ok."
+
+
+def update_flight_history(sample_ts: datetime, airborne_count: int):
+    """
+    Store aggregate samples in session memory.
+    """
+    if "iran_flight_samples" not in st.session_state:
+        st.session_state["iran_flight_samples"] = []
+
+    st.session_state["iran_flight_samples"].append({"ts": sample_ts, "airborne": int(airborne_count)})
+
+    # keep last ~48h worth if sampled every few minutes; cap list to stay safe
+    st.session_state["iran_flight_samples"] = st.session_state["iran_flight_samples"][-500:]
+
+
+def compute_flight_z_last_24h(now_ts: datetime) -> Tuple[Optional[float], pd.DataFrame]:
+    """
+    Compute z-score of latest airborne count vs last 24h of in-session samples.
+    Returns (z, df_samples_24h)
+    """
+    samples = st.session_state.get("iran_flight_samples", [])
+    if not samples:
+        return None, pd.DataFrame(columns=["ts", "airborne"])
+
+    df = pd.DataFrame(samples)
     if df.empty:
-        return empty_states_df(), "OpenSky returned states but none were parseable."
+        return None, pd.DataFrame(columns=["ts", "airborne"])
 
-    return df, f"{msg} OpenSky snapshot loaded: {len(df)} states."
+    df["ts"] = pd.to_datetime(df["ts"], utc=True)
+    cutoff = now_ts - timedelta(hours=24)
+    df24 = df[df["ts"] >= cutoff].sort_values("ts")
+    if len(df24) < 6:
+        return None, df24
 
-
-def render_opensky_aggregates(states_df: pd.DataFrame):
-    st.subheader("Flight activity (OpenSky) — aggregated snapshot")
-    st.caption("Counts only (analysis view). No per-aircraft tracking list is shown by default.")
-
-    if states_df.empty:
-        st.info("No OpenSky data available right now.")
-        return
-
-    sdf = states_df.copy()
-    sdf["air_status"] = np.where(sdf["on_ground"] == True, "on_ground", "airborne")
-    sdf["callsign_prefix"] = sdf["callsign"].fillna("").astype(str).str.strip().str[:3].replace("", "UNK")
-
-    with st.expander("Optional filters (aggregated only)", expanded=False):
-        kw = st.text_input(
-            "Filter by callsign keyword (optional)",
-            value="",
-            help="Example: an airline code like 'DLH' or 'BAW'.",
-        )
-        show_prefix_table = st.checkbox("Show callsign prefix table (aggregated)", value=True)
-
-    if kw.strip():
-        sdf = sdf[sdf["callsign"].astype(str).str.contains(kw.strip(), case=False, na=False)]
-
-    by_country = (
-        sdf.groupby("origin_country")
-        .size()
-        .reset_index(name="count")
-        .sort_values("count", ascending=False)
-        .head(25)
-    )
-    fig1 = px.bar(by_country, x="origin_country", y="count", title="Top origin countries (snapshot)")
-    st.plotly_chart(fig1, use_container_width=True)
-    st.dataframe(by_country, use_container_width=True, hide_index=True)
-
-    by_status = (
-        sdf.groupby("air_status")
-        .size()
-        .reset_index(name="count")
-        .sort_values("count", ascending=False)
-    )
-    fig2 = px.bar(by_status, x="air_status", y="count", title="Airborne vs on-ground (snapshot)")
-    st.plotly_chart(fig2, use_container_width=True)
-    st.dataframe(by_status, use_container_width=True, hide_index=True)
-
-    if show_prefix_table:
-        by_prefix = (
-            sdf.groupby("callsign_prefix")
-            .size()
-            .reset_index(name="count")
-            .sort_values("count", ascending=False)
-            .head(30)
-        )
-        fig3 = px.bar(by_prefix, x="callsign_prefix", y="count", title="Top callsign prefixes (snapshot)")
-        st.plotly_chart(fig3, use_container_width=True)
-        st.dataframe(by_prefix, use_container_width=True, hide_index=True)
+    z = float(zscore(df24["airborne"]).iloc[-1])
+    return z, df24
 
 
 # =============================
 # UI
 # =============================
 st.title("USA–Iran Tension Dashboard")
-st.caption(
-    "A transparent indicator built from public news signals (GDELT). "
-    "Not a literal probability-of-war predictor."
-)
+st.caption("News-derived tension indicator (GDELT) + aggregate air-traffic signal over Iran (OpenSky).")
 
-tab1, tab2 = st.tabs(["Tension dashboard (GDELT)", "Flight activity (OpenSky)"])
+tab1, tab2 = st.tabs(["Tension dashboard", "Air traffic signal"])
 
-with tab1:
-    st.info(
-        "⏱️ To avoid GDELT rate limits, data is cached for **1 hour**. "
-        "Sliders update instantly using cached data. Use **Refresh now** only if needed."
+# Sidebar controls (shared)
+with st.sidebar:
+    st.header("GDELT")
+    default_query = "(United States OR USA OR US) (Iran OR Iranian)"
+    query = st.text_input("GDELT query", value=default_query)
+
+    window_days = st.slider("Lookback (days)", 7, 180, DEFAULT_WINDOW_DAYS)
+    maxrecords = st.slider("Max articles to fetch", 50, 250, DEFAULT_MAXRECORDS, step=25)
+
+    st.header("Scoring weights")
+    w_hostile = st.slider("Hostile (↑)", 0.0, 5.0, 2.0, 0.1)
+    w_military = st.slider("Military (↑)", 0.0, 5.0, 1.5, 0.1)
+    w_diplomacy = st.slider("Diplomacy (↓)", 0.0, 5.0, 1.0, 0.1)
+    smooth_days = st.slider("Smoothing (days)", 1, 14, 3)
+
+    st.header("Air traffic signal")
+    enable_air_signal = st.checkbox("Enable Iran air-traffic signal", value=True)
+    # Interpretation: if traffic DROPS vs baseline -> risk should INCREASE
+    w_air_traffic = st.slider("Air traffic impact (↑ when traffic drops)", 0.0, 3.0, 1.0, 0.1)
+
+    st.caption("This uses an aggregate count of airborne aircraft within an Iran bounding box (no per-aircraft listing).")
+
+    st.header("Controls")
+    refresh = st.button("Refresh now")
+
+
+# Refresh cooldown (per session)
+if "last_refresh_ts" not in st.session_state:
+    st.session_state["last_refresh_ts"] = 0.0
+
+cooldown_seconds = 30
+cache_key = "stable"
+if refresh:
+    now_ts = time.time()
+    if now_ts - st.session_state["last_refresh_ts"] < cooldown_seconds:
+        st.warning(f"Please wait {cooldown_seconds} seconds between refreshes to avoid rate limits.")
+    else:
+        st.session_state["last_refresh_ts"] = now_ts
+        cache_key = utc_now().strftime("%Y%m%d%H%M%S")
+
+
+# --- Fetch GDELT ---
+end_dt = utc_now()
+start_dt = end_dt - timedelta(days=int(window_days))
+
+with st.spinner("Fetching GDELT articles…"):
+    fetch = fetch_gdelt_articles(
+        query=query,
+        start_dt=start_dt,
+        end_dt=end_dt,
+        maxrecords=maxrecords,
+        cache_key=cache_key,
     )
 
-    with st.sidebar:
-        st.header("Query & window")
+if "last_good_df" not in st.session_state:
+    st.session_state["last_good_df"] = empty_articles_df()
 
-        default_query = "(United States OR USA OR US) (Iran OR Iranian)"
-        query = st.text_input("GDELT query", value=default_query)
+if fetch.status == "error":
+    st.warning(fetch.detail)
+    articles = st.session_state["last_good_df"]
+    detail_msg = "Showing last cached data."
+else:
+    articles = fetch.df
+    detail_msg = fetch.detail
+    if not articles.empty:
+        st.session_state["last_good_df"] = articles
 
-        window_days = st.slider("Lookback (days)", 7, 180, DEFAULT_WINDOW_DAYS)
-        maxrecords = st.slider("Max articles to fetch", 50, 250, DEFAULT_MAXRECORDS, step=25)
+daily = build_daily_features(articles)
+scored = compute_score(daily, w_hostile, w_military, w_diplomacy, smooth_days=smooth_days)
 
-        st.header("Scoring weights")
-        w_hostile = st.slider("Hostile (↑)", 0.0, 5.0, 2.0, 0.1)
-        w_military = st.slider("Military (↑)", 0.0, 5.0, 1.5, 0.1)
-        w_diplomacy = st.slider("Diplomacy (↓)", 0.0, 5.0, 1.0, 0.1)
+base_latest_score = float(scored["score"].iloc[-1]) if len(scored) else float("nan")
 
-        smooth_days = st.slider("Smoothing (days)", 1, 14, 3)
 
-        st.header("Controls")
-        refresh = st.button("Refresh now")
+# --- Fetch OpenSky Iran bbox aggregate (ONE call) ---
+# A practical bbox covering Iran (city ranges roughly: lat 25.29–39.65, lon 44.77–61.49). :contentReference[oaicite:2]{index=2}
+IR_LAMIN, IR_LAMAX = 25.29, 39.65
+IR_LOMIN, IR_LOMAX = 44.77, 61.49
 
-    if "last_refresh_ts" not in st.session_state:
-        st.session_state["last_refresh_ts"] = 0.0
+airborne_over_iran = None
+air_msg = "Air traffic signal disabled."
+flight_z = None
+df24 = pd.DataFrame(columns=["ts", "airborne"])
+adjusted_latest_score = base_latest_score
 
-    cooldown_seconds = 30
-    cache_key = "stable"
-
-    if refresh:
-        now_ts = time.time()
-        if now_ts - st.session_state["last_refresh_ts"] < cooldown_seconds:
-            st.warning(f"Please wait {cooldown_seconds} seconds between refreshes to avoid rate limits.")
-        else:
-            st.session_state["last_refresh_ts"] = now_ts
-            cache_key = utc_now().strftime("%Y%m%d%H%M%S")
-
-    end_dt = utc_now()
-    start_dt = end_dt - timedelta(days=int(window_days))
-
-    with st.spinner("Fetching GDELT articles…"):
-        fetch = fetch_gdelt_articles(
-            query=query,
-            start_dt=start_dt,
-            end_dt=end_dt,
-            maxrecords=maxrecords,
-            cache_key=cache_key,
+if enable_air_signal:
+    with st.spinner("Fetching OpenSky air-traffic snapshot over Iran…"):
+        # Round cache key to 10-minute buckets to reduce repeated token/state requests
+        bucket = end_dt.replace(minute=(end_dt.minute // 10) * 10, second=0, microsecond=0)
+        os_cache_key = bucket.strftime("%Y%m%d%H%M")
+        count, air_msg = fetch_opensky_states_bbox(
+            cache_key=os_cache_key,
+            lamin=IR_LAMIN,
+            lamax=IR_LAMAX,
+            lomin=IR_LOMIN,
+            lomax=IR_LOMAX,
         )
+        airborne_over_iran = int(count)
+        update_flight_history(end_dt, airborne_over_iran)
+        flight_z, df24 = compute_flight_z_last_24h(end_dt)
 
-    if "last_good_df" not in st.session_state:
-        st.session_state["last_good_df"] = empty_articles_df()
+    # Adjust only if we have enough history to compute a meaningful z-score
+    if flight_z is not None and not math.isnan(base_latest_score):
+        raw = logit_from_0_100(base_latest_score)
+        # Traffic drop -> negative z. We want that to INCREASE risk => subtract z * weight.
+        raw_adj = raw + (-w_air_traffic * float(flight_z))
+        adjusted_latest_score = logistic_0_100(raw_adj)
 
-    if fetch.status == "error":
-        st.warning(fetch.detail)
-        articles = st.session_state["last_good_df"]
-        detail_msg = "Showing last cached data."
-    else:
-        articles = fetch.df
-        detail_msg = fetch.detail
-        if not articles.empty:
-            st.session_state["last_good_df"] = articles
+
+# =============================
+# TAB 1: Main dashboard
+# =============================
+with tab1:
+    st.info(
+        "GDELT is cached (1 hour) to avoid rate limits. "
+        "OpenSky air-traffic snapshot is cached (~10 minutes). "
+        "The air-traffic signal adjusts the **latest** score only (session baseline)."
+    )
 
     if detail_msg:
         st.write(detail_msg)
 
-    daily = build_daily_features(articles)
-    scored = compute_score(daily, w_hostile, w_military, w_diplomacy, smooth_days=smooth_days)
+    # KPIs
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Base risk score (latest)", "—" if math.isnan(base_latest_score) else f"{base_latest_score:.1f}/100")
+    c2.metric("Adjusted score (latest)", "—" if math.isnan(adjusted_latest_score) else f"{adjusted_latest_score:.1f}/100")
+    c3.metric("Articles fetched", f"{len(articles)}")
+    c4.metric("Window", f"{window_days} days")
+    c5.metric("Updated (UTC)", end_dt.strftime("%Y-%m-%d %H:%M"))
 
-    c1, c2, c3, c4 = st.columns(4)
-    latest_score = float(scored["score"].iloc[-1]) if len(scored) else float("nan")
+    st.caption(f"OpenSky: {air_msg}")
 
-    c1.metric("Risk score (latest)", "—" if math.isnan(latest_score) else f"{latest_score:.1f}/100")
-    c2.metric("Articles fetched", f"{len(articles)}")
-    c3.metric("Window", f"{window_days} days")
-    c4.metric("Updated (UTC)", end_dt.strftime("%Y-%m-%d %H:%M"))
+    # Extra KPI row for air traffic
+    a1, a2, a3 = st.columns(3)
+    a1.metric("Airborne over Iran (snapshot)", "—" if airborne_over_iran is None else str(airborne_over_iran))
+    a2.metric("Air-traffic z-score (24h, session)", "—" if flight_z is None else f"{flight_z:+.2f}")
+    a3.metric("Air traffic weight", f"{w_air_traffic:.1f}")
 
     st.divider()
 
     left, right = st.columns([1.25, 1])
 
     with left:
-        st.subheader("Risk score over time")
+        st.subheader("Risk score over time (base)")
         if scored.empty:
             st.info("No usable articles in this window. Try a longer window or loosen the query.")
         else:
@@ -580,7 +601,7 @@ with tab1:
             st.plotly_chart(fig2, use_container_width=True)
 
     with right:
-        st.subheader("Latest-day drivers")
+        st.subheader("Latest-day drivers (base)")
         if scored.empty:
             st.write("—")
         else:
@@ -594,7 +615,6 @@ with tab1:
             ).sort_values("effect", ascending=False)
 
             st.dataframe(drivers, use_container_width=True, hide_index=True)
-            st.caption("Effects are based on smoothed z-scores and your weights.")
 
         st.subheader("Latest matching articles")
         if articles.empty:
@@ -612,22 +632,25 @@ with tab1:
     with st.expander("Raw daily table"):
         st.dataframe(scored, use_container_width=True)
 
+
+# =============================
+# TAB 2: Air traffic signal details (aggregated)
+# =============================
 with tab2:
-    st.info(
-        "OpenSky data is shown as **aggregated counts** (analysis view). "
-        "Snapshot is cached for 10 minutes."
+    st.subheader("Iran air-traffic signal (aggregated)")
+    st.caption(
+        "This tab shows the **session baseline** of airborne aircraft counts in an Iran bounding box "
+        "and how it converts into a z-score used to adjust the latest tension score."
     )
 
-    colA, colB = st.columns([1, 2])
-    with colA:
-        opensky_refresh = st.button("Refresh OpenSky snapshot")
-    with colB:
-        st.caption("Tip: refresh only if needed.")
+    st.write(f"Bounding box (Iran): lat {IR_LAMIN}–{IR_LAMAX}, lon {IR_LOMIN}–{IR_LOMAX}.")
+    st.write(air_msg)
 
-    opensky_cache_key = utc_now().strftime("%Y%m%d%H%M%S") if opensky_refresh else "stable"
-
-    with st.spinner("Fetching OpenSky snapshot…"):
-        states_df, msg = fetch_opensky_states(opensky_cache_key)
-
-    st.write(msg)
-    render_opensky_aggregates(states_df)
+    if df24.empty:
+        st.info("Not enough samples yet to compute a stable 24h baseline. Leave the app running / refresh occasionally.")
+    else:
+        plot_df = df24.copy()
+        plot_df["ts"] = pd.to_datetime(plot_df["ts"], utc=True)
+        fig = px.line(plot_df, x="ts", y="airborne", title="Airborne aircraft over Iran (session samples, last 24h)")
+        st.plotly_chart(fig, use_container_width=True)
+        st.dataframe(plot_df.tail(50), use_container_width=True, hide_index=True)
