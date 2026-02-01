@@ -17,6 +17,7 @@ import streamlit as st
 st.set_page_config(page_title="USA–Iran Tension Dashboard", layout="wide")
 
 GDELT_DOCS_API = "https://api.gdeltproject.org/api/v2/doc/doc"
+
 DEFAULT_WINDOW_DAYS = 30
 DEFAULT_MAXRECORDS = 250
 
@@ -58,9 +59,9 @@ def empty_articles_df() -> pd.DataFrame:
 def parse_any_datetime(value: object) -> Optional[datetime]:
     """
     Robust parser for multiple timestamp formats:
-    - 'YYYYMMDDHHMMSS'
+    - 'YYYYMMDDHHMMSS' (legacy GDELT)
     - ISO-8601
-    - any date-like string parseable by pandas
+    - many other date strings parseable by pandas
     Returns timezone-aware UTC datetime or None.
     """
     if value is None:
@@ -70,20 +71,18 @@ def parse_any_datetime(value: object) -> Optional[datetime]:
     if not s:
         return None
 
-    # Common legacy GDELT format: 20260131123000
+    # Legacy numeric format: 20260131123000
     if s.isdigit() and len(s) >= 14:
         try:
-            dt = datetime.strptime(s[:14], "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
-            return dt
+            return datetime.strptime(s[:14], "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
         except Exception:
             pass
 
-    # Try pandas parser (handles ISO and many variants)
+    # Fallback to pandas parser
     try:
         dt = pd.to_datetime(s, utc=True, errors="coerce")
         if pd.isna(dt):
             return None
-        # dt might be Timestamp
         return dt.to_pydatetime()
     except Exception:
         return None
@@ -116,7 +115,7 @@ def classify_title(title: str) -> Dict[str, int]:
 
 
 # =============================
-# GDELT fetcher (robust)
+# GDELT fetcher (robust + rate-limit aware)
 # =============================
 @dataclass
 class FetchResult:
@@ -126,10 +125,22 @@ class FetchResult:
 
 
 def _gdelt_request(params: dict, timeout: int = 30) -> Tuple[Optional[dict], Optional[str]]:
+    """
+    Returns (json, error_message). Handles non-JSON and 429 rate limits.
+    """
     try:
-        r = requests.get(GDELT_DOCS_API, params=params, timeout=timeout)
+        r = requests.get(
+            GDELT_DOCS_API,
+            params=params,
+            timeout=timeout,
+            headers={"User-Agent": "tension-dashboard/1.0"},
+        )
     except requests.RequestException as e:
         return None, f"Network error: {e}"
+
+    if r.status_code == 429:
+        # GDELT rate limit: 1 request / 5 seconds
+        return None, "GDELT rate limit reached (HTTP 429). Please wait a moment and try again."
 
     if r.status_code != 200:
         snippet = (r.text or "")[:220].replace("\n", " ").strip()
@@ -146,13 +157,13 @@ def _gdelt_request(params: dict, timeout: int = 30) -> Tuple[Optional[dict], Opt
         return None, f"Failed to parse JSON. Snippet: {snippet}"
 
 
-@st.cache_data(ttl=15 * 60, show_spinner=False)
+@st.cache_data(ttl=60 * 60, show_spinner=False)  # 1 hour cache to avoid 429 storms on Streamlit Cloud
 def fetch_gdelt_articles(
     query: str,
     start_dt: datetime,
     end_dt: datetime,
     maxrecords: int,
-    cache_key: str,  # used only to bust cache
+    cache_key: str,  # used only to bust cache; not sent to GDELT
 ) -> FetchResult:
     params = {
         "query": query,
@@ -166,8 +177,10 @@ def fetch_gdelt_articles(
 
     data, err = _gdelt_request(params)
     if err:
-        time.sleep(0.7)
-        data, err = _gdelt_request(params)
+        # One gentle retry (but 429 won’t be retried)
+        if "429" not in err:
+            time.sleep(0.7)
+            data, err = _gdelt_request(params)
         if err:
             return FetchResult(empty_articles_df(), "error", err)
 
@@ -175,7 +188,7 @@ def fetch_gdelt_articles(
     if not articles:
         return FetchResult(empty_articles_df(), "ok", "No articles returned for that window/query.")
 
-    # Possible timestamp keys across schema variations
+    # Timestamp keys across schema variations
     ts_keys = ["seendate", "seenDate", "seen_date", "datetime", "date"]
 
     rows = []
@@ -185,7 +198,7 @@ def fetch_gdelt_articles(
     for a in articles:
         ts_val = None
         for k in ts_keys:
-            if k in a and a.get(k):
+            if a.get(k):
                 ts_val = a.get(k)
                 break
 
@@ -212,13 +225,13 @@ def fetch_gdelt_articles(
     if not rows:
         detail = (
             "GDELT returned matches, but none had a parseable timestamp. "
-            f"Skipped: no timestamp field={skipped_no_ts}, unparseable timestamp={skipped_unparseable_ts}. "
-            "Try increasing lookback days or loosening the query."
+            f"Skipped: no timestamp field={skipped_no_ts}, unparseable timestamp={skipped_unparseable_ts}."
         )
         return FetchResult(empty_articles_df(), "ok", detail)
 
     df = pd.DataFrame(rows, columns=EXPECTED_ARTICLE_COLS).sort_values("datetime")
-    return FetchResult(df, "ok", f"Fetched {len(df)} articles (skipped {skipped_no_ts + skipped_unparseable_ts}).")
+    detail = f"Fetched {len(df)} articles (skipped {skipped_no_ts + skipped_unparseable_ts})."
+    return FetchResult(df, "ok", detail)
 
 
 # =============================
@@ -289,14 +302,20 @@ st.caption(
     "Not a literal probability-of-war predictor."
 )
 
+st.info(
+    "⏱️ To avoid GDELT rate limits, data is cached for **1 hour**. "
+    "Sliders update instantly using cached data. Use **Refresh now** only if needed."
+)
+
 with st.sidebar:
     st.header("Query & window")
 
+    # Avoid quoted short tokens like "U.S."
     default_query = "(United States OR USA OR US) (Iran OR Iranian)"
     query = st.text_input("GDELT query", value=default_query)
 
-    window_days = st.slider("Lookback (days)", 7, 180, 30)
-    maxrecords = st.slider("Max articles to fetch", 50, 250, 250, step=25)
+    window_days = st.slider("Lookback (days)", 7, 180, DEFAULT_WINDOW_DAYS)
+    maxrecords = st.slider("Max articles to fetch", 50, 250, DEFAULT_MAXRECORDS, step=25)
 
     st.header("Scoring weights")
     w_hostile = st.slider("Hostile (↑)", 0.0, 5.0, 2.0, 0.1)
@@ -308,7 +327,22 @@ with st.sidebar:
     st.header("Controls")
     refresh = st.button("Refresh now")
 
-cache_key = utc_now().strftime("%Y%m%d%H%M%S") if refresh else "stable"
+
+# Refresh cooldown (per user session)
+if "last_refresh_ts" not in st.session_state:
+    st.session_state["last_refresh_ts"] = 0.0
+
+cooldown_seconds = 30
+cache_key = "stable"
+
+if refresh:
+    now_ts = time.time()
+    if now_ts - st.session_state["last_refresh_ts"] < cooldown_seconds:
+        st.warning(f"Please wait {cooldown_seconds} seconds between refreshes to avoid rate limits.")
+    else:
+        st.session_state["last_refresh_ts"] = now_ts
+        cache_key = utc_now().strftime("%Y%m%d%H%M%S")  # bust cache on demand
+
 
 end_dt = utc_now()
 start_dt = end_dt - timedelta(days=int(window_days))
@@ -322,14 +356,26 @@ with st.spinner("Fetching GDELT articles…"):
         cache_key=cache_key,
     )
 
+# Keep last good data to survive 429 / errors without showing an empty app
+if "last_good_df" not in st.session_state:
+    st.session_state["last_good_df"] = empty_articles_df()
+if "last_good_detail" not in st.session_state:
+    st.session_state["last_good_detail"] = ""
+
 if fetch.status == "error":
-    st.error(fetch.detail)
-    st.stop()
+    st.warning(fetch.detail)
+    articles = st.session_state["last_good_df"]
+    detail_msg = "Showing last cached data."
+else:
+    articles = fetch.df
+    detail_msg = fetch.detail
+    if not articles.empty:
+        st.session_state["last_good_df"] = articles
+        st.session_state["last_good_detail"] = fetch.detail
 
-if fetch.detail:
-    st.info(fetch.detail)
+if detail_msg:
+    st.write(detail_msg)
 
-articles = fetch.df
 daily = build_daily_features(articles)
 scored = compute_score(daily, w_hostile, w_military, w_diplomacy, smooth_days=smooth_days)
 
@@ -380,6 +426,7 @@ with right:
         ).sort_values("effect", ascending=False)
 
         st.dataframe(drivers, use_container_width=True, hide_index=True)
+        st.caption("Effects are based on smoothed z-scores and your weights.")
 
     st.subheader("Latest matching articles")
     if articles.empty:
