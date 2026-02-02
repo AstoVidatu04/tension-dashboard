@@ -3,7 +3,7 @@ import pandas as pd
 from typing import Any, Dict
 
 GDELT_DOC_ENDPOINT = "https://api.gdeltproject.org/api/v2/doc/doc"
-__VERSION__ = "gdelt_structured_fix_2026-02-02_v1"
+
 
 def _safe_json(resp: requests.Response) -> Dict[str, Any]:
     ctype = (resp.headers.get("content-type") or "").lower()
@@ -13,6 +13,7 @@ def _safe_json(resp: requests.Response) -> Dict[str, Any]:
         return resp.json() or {}
     except ValueError:
         return {}
+
 
 def fetch_gdelt_articles(query: str, hours_back: int, max_records: int) -> pd.DataFrame:
     max_records = int(max_records)
@@ -49,48 +50,49 @@ def fetch_gdelt_articles(query: str, hours_back: int, max_records: int) -> pd.Da
 
     df = pd.DataFrame(arts)
 
-    # Normalize expected columns
+    # Ensure expected columns always exist
     for col in ["url", "title", "domain", "seendate", "tone", "themes_list"]:
         if col not in df.columns:
             df[col] = None
 
-    # Parse seendate safely (handles YYYYMMDDHHMMSS and ISO)
+    # Parse seendate safely (handles numeric + ISO)
     sd = df["seendate"].astype(str).str.strip()
     is_num14 = sd.str.fullmatch(r"\d{14}")
+
     se = pd.Series(pd.NaT, index=df.index, dtype="datetime64[ns, UTC]")
     if is_num14.any():
-        se.loc[is_num14] = pd.to_datetime(sd.loc[is_num14], format="%Y%m%d%H%M%S", utc=True, errors="coerce")
+        se.loc[is_num14] = pd.to_datetime(
+            sd.loc[is_num14], format="%Y%m%d%H%M%S", utc=True, errors="coerce"
+        )
     if (~is_num14).any():
-        se.loc[~is_num14] = pd.to_datetime(sd.loc[~is_num14], utc=True, errors="coerce")
-    df["seendate"] = se
+        se.loc[~is_num14] = pd.to_datetime(
+            sd.loc[~is_num14], utc=True, errors="coerce"
+        )
 
+    df["seendate"] = se
     df["tone"] = pd.to_numeric(df["tone"], errors="coerce")
+
     return df
+
 
 def dedupe_syndication(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Light de-duplication:
-    - exact URL
-    - very similar titles within same day (cheap heuristic)
-
-    IMPORTANT: This function forces datetime conversion right before `.dt` usage,
-    which prevents the Streamlit Cloud crash: 'Can only use .dt accessor with datetimelike values'.
+    Safe deduplication that NEVER calls .dt on non-datetime data.
     """
     if df is None or df.empty:
         return pd.DataFrame() if df is None else df
 
     out = df.copy()
 
+    # URL dedupe
     if "url" in out.columns:
         out = out.drop_duplicates(subset=["url"]).copy()
-    else:
-        out["url"] = None
 
+    # Title canonicalization
     if "title" not in out.columns:
         out["title"] = ""
 
-    # Title canonicalization
-    t = (
+    out["_tcanon"] = (
         out["title"]
         .fillna("")
         .astype(str)
@@ -99,10 +101,10 @@ def dedupe_syndication(df: pd.DataFrame) -> pd.DataFrame:
         .str.replace(r"[^a-z0-9 ]+", "", regex=True)
         .str.strip()
     )
-    out["_tcanon"] = t
 
-    # Force datetime conversion at point of use (UTC)
-    se = pd.to_datetime(out.get("seendate", pd.Series([pd.NaT]*len(out))), utc=True, errors="coerce")
+    # FORCE datetime conversion here (this is the critical fix)
+    se = pd.to_datetime(out.get("seendate"), utc=True, errors="coerce")
+
     if se.notna().any():
         out["_day"] = se.dt.floor("D")
         out = out.drop_duplicates(subset=["_day", "_tcanon"]).copy()
@@ -112,12 +114,15 @@ def dedupe_syndication(df: pd.DataFrame) -> pd.DataFrame:
 
     return out
 
+
 def source_diversity_factor(df: pd.DataFrame) -> float:
     if df is None or df.empty:
         return 0.8
+
     n = len(df)
-    d = int(df.get("domain", pd.Series(["unknown"]*n)).fillna("unknown").nunique())
+    d = int(df.get("domain", pd.Series(["unknown"] * n)).fillna("unknown").nunique())
     ratio = d / max(n, 1)
+
     if d <= 3 and n >= 20:
         return 0.65
     if ratio >= 0.5 and d >= 10:
@@ -126,33 +131,42 @@ def source_diversity_factor(df: pd.DataFrame) -> float:
         return 1.05
     return 0.9
 
+
 def structured_signal_score(df: pd.DataFrame) -> dict:
     if df is None or df.empty:
         return {"tension_core": 0.0, "diplomacy_share": 0.0, "uncertainty": 1.0}
 
     n = max(len(df), 1)
-    tone = pd.to_numeric(df.get("tone", pd.Series([pd.NA]*len(df))), errors="coerce").clip(-10, 10)
+    tone = pd.to_numeric(df.get("tone"), errors="coerce").clip(-10, 10)
     neg_mass = float((-tone[tone < 0]).sum()) if tone.notna().any() else 0.0
-    tension_core = float(neg_mass / n)
+    tension_core = neg_mass / n
 
-    dip_keywords = {"NEGOTIATIONS", "MEDIATION", "DIPLOMACY", "PEACE", "CEASEFIRE", "TREATY"}
-    themes = df.get("themes_list", pd.Series([None]*len(df)))
+    dip_keywords = {
+        "NEGOTIATIONS",
+        "MEDIATION",
+        "DIPLOMACY",
+        "PEACE",
+        "CEASEFIRE",
+        "TREATY",
+    }
+
+    themes = df.get("themes_list", pd.Series([None] * n))
 
     def is_diplomatic(x):
         if not isinstance(x, list):
             return False
         for t in x:
-            if not isinstance(t, str):
-                continue
-            u = t.upper()
-            for k in dip_keywords:
-                if k in u:
-                    return True
+            if isinstance(t, str):
+                u = t.upper()
+                for k in dip_keywords:
+                    if k in u:
+                        return True
         return False
 
-    diplomacy_share = float(themes.apply(is_diplomatic).sum() / n) if len(themes) else 0.0
+    diplomacy_share = float(themes.apply(is_diplomatic).sum() / n)
 
-    div = int(df.get("domain", pd.Series(["unknown"]*len(df))).fillna("unknown").nunique())
+    div = int(df.get("domain", pd.Series(["unknown"] * n)).fillna("unknown").nunique())
+
     if n >= 80 and div >= 25:
         uncertainty = 0.5
     elif n >= 40 and div >= 15:
@@ -162,4 +176,8 @@ def structured_signal_score(df: pd.DataFrame) -> dict:
     else:
         uncertainty = 1.1
 
-    return {"tension_core": tension_core, "diplomacy_share": diplomacy_share, "uncertainty": float(uncertainty)}
+    return {
+        "tension_core": float(tension_core),
+        "diplomacy_share": float(diplomacy_share),
+        "uncertainty": float(uncertainty),
+    }
