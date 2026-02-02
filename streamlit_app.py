@@ -1,3 +1,4 @@
+APP_BUILD = "2026-02-02-01"
 import math
 import time
 from datetime import datetime, timedelta, timezone
