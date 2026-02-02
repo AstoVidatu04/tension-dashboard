@@ -13,6 +13,7 @@ import requests
 import sqlite3
 import streamlit as st
 
+
 from gdelt_structured import (
     fetch_gdelt_articles as fetch_gdelt_articles_structured,
     dedupe_syndication,
@@ -36,6 +37,12 @@ OPENSKY_TOKEN_URL = "https://auth.opensky-network.org/auth/realms/opensky-networ
 
 IR_LAMIN, IR_LAMAX = 25.29, 39.65
 IR_LOMIN, IR_LOMAX = 44.77, 61.49
+
+# --- OpenSky protection settings ---
+OPENSKY_BUCKET_MINUTES = 10           # do not fetch more often than this (per cache bucket)
+OPENSKY_HTTP_TIMEOUT = 10             # seconds (keep small to avoid hanging the app)
+OPENSKY_BREAKER_MINUTES = 30          # if OpenSky errors, stop trying for this long
+OPENSKY_TOKEN_TTL_SECONDS = 6 * 3600  # cache token for 6 hours (avoid auth hammering)
 
 
 def utc_now() -> datetime:
@@ -333,15 +340,29 @@ def get_secret(key: str) -> str:
     if key in st.secrets:
         return str(st.secrets[key])
     import os
-
     v = os.environ.get(key)
     if v:
         return v
     raise RuntimeError(f"Missing secret: {key}")
 
 
-@st.cache_data(ttl=50 * 60, show_spinner=False)
-def fetch_opensky_token(cache_key: str) -> Tuple[Optional[str], str]:
+# -----------------------------
+# OpenSky: Circuit breaker + safer fetch
+# -----------------------------
+def opensky_is_in_backoff() -> bool:
+    until = float(st.session_state.get("opensky_backoff_until", 0.0))
+    return time.time() < until
+
+
+def opensky_trip_breaker(reason: str) -> str:
+    backoff_until = time.time() + OPENSKY_BREAKER_MINUTES * 60
+    st.session_state["opensky_backoff_until"] = backoff_until
+    st.session_state["opensky_fail_count"] = int(st.session_state.get("opensky_fail_count", 0)) + 1
+    return f"OpenSky temporarily disabled for {OPENSKY_BREAKER_MINUTES} min (reason: {reason})"
+
+
+@st.cache_data(ttl=OPENSKY_TOKEN_TTL_SECONDS, show_spinner=False)
+def fetch_opensky_token_cached(cache_key: str) -> Tuple[Optional[str], str]:
     _ = cache_key
     try:
         client_id = get_secret("OPENSKY_CLIENT_ID")
@@ -357,7 +378,7 @@ def fetch_opensky_token(cache_key: str) -> Tuple[Optional[str], str]:
                 "client_id": client_id,
                 "client_secret": client_secret,
             },
-            timeout=30,
+            timeout=OPENSKY_HTTP_TIMEOUT,
             headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
     except requests.RequestException as e:
@@ -377,50 +398,94 @@ def fetch_opensky_token(cache_key: str) -> Tuple[Optional[str], str]:
     return token, "OK"
 
 
-@st.cache_data(ttl=10 * 60, show_spinner=False)
-def fetch_opensky_states_bbox(
+@st.cache_data(ttl=OPENSKY_BUCKET_MINUTES * 60, show_spinner=False)
+def fetch_opensky_states_bbox_safe(
     cache_key: str,
     lamin: float,
     lamax: float,
     lomin: float,
     lomax: float,
-) -> Tuple[int, str]:
-    token, msg = fetch_opensky_token("token-" + cache_key)
-    if not token:
-        return 0, msg
+) -> Tuple[Optional[int], str]:
+    """
+    Returns:
+      (airborne_count, message)
+    airborne_count is None on failure (so we don't insert bogus 0 into DB).
+    """
+    _ = cache_key
+
+    # If breaker is tripped, skip completely
+    if opensky_is_in_backoff():
+        until = float(st.session_state.get("opensky_backoff_until", 0.0))
+        mins = int(max(0, (until - time.time()) // 60))
+        return None, f"OpenSky backoff active ({mins} min remaining)."
 
     params = {"lamin": lamin, "lamax": lamax, "lomin": lomin, "lomax": lomax}
+
+    # Try token (but don't *require* it)
+    token, tok_msg = fetch_opensky_token_cached("token-" + cache_key)
+    headers = {"User-Agent": "tension-dashboard/1.0"}
+
+    # 1) Attempt authenticated if token exists
+    if token:
+        try:
+            r = requests.get(
+                OPENSKY_STATES_URL,
+                params=params,
+                timeout=OPENSKY_HTTP_TIMEOUT,
+                headers={**headers, "Authorization": f"Bearer {token}"},
+            )
+            if r.status_code == 200 and safe_is_json_response(r):
+                js = r.json()
+                states = js.get("states") or []
+                airborne = 0
+                for s in states:
+                    if isinstance(s, list) and len(s) > 8:
+                        if s[8] is False:
+                            airborne += 1
+                return airborne, "OK (auth)"
+        except requests.RequestException as e:
+            # fall through to unauth attempt; don't trip breaker yet
+            auth_err = str(e)
+        else:
+            auth_err = "auth request failed"
+
+    # 2) Attempt unauthenticated (often works even when auth endpoint is blocked)
     try:
         r = requests.get(
             OPENSKY_STATES_URL,
             params=params,
-            timeout=30,
-            headers={"Authorization": f"Bearer {token}", "User-Agent": "tension-dashboard/1.0"},
+            timeout=OPENSKY_HTTP_TIMEOUT,
+            headers=headers,
         )
     except requests.RequestException as e:
-        return 0, f"OpenSky request error: {e}"
+        # Trip breaker on hard connectivity problems
+        reason = str(e)
+        return None, opensky_trip_breaker(reason)
 
     if r.status_code != 200:
         snippet = (r.text or "")[:220].replace("\n", " ").strip()
-        return 0, f"OpenSky HTTP {r.status_code}. Snippet: {snippet}"
+        # Trip breaker on repeated non-200 as well (common when blackholed/throttled)
+        return None, opensky_trip_breaker(f"HTTP {r.status_code} {snippet}")
 
     if not safe_is_json_response(r):
-        return 0, "OpenSky returned non-JSON response."
+        return None, opensky_trip_breaker("non-JSON response")
 
     js = r.json()
     states = js.get("states") or []
-    if not states:
-        return 0, f"{msg} OpenSky returned 0 states in bbox."
-
     airborne = 0
     for s in states:
         if isinstance(s, list) and len(s) > 8:
             if s[8] is False:
                 airborne += 1
 
-    return airborne, msg
+    # Don't trip breaker if we got a valid response, even if states=0
+    # (0 can be legit depending on bbox/time)
+    return airborne, "OK (unauth)"
 
 
+# -----------------------------
+# App UI
+# -----------------------------
 init_flights_db()
 
 st.title("USA–Iran Tension Dashboard")
@@ -529,19 +594,27 @@ df24 = pd.DataFrame(columns=["ts", "airborne"])
 
 adjusted_latest_score = base_latest_score
 
+# ---- OpenSky fetch (safe) ----
 if enable_air_signal:
+    bucket = end_dt.replace(
+        minute=(end_dt.minute // OPENSKY_BUCKET_MINUTES) * OPENSKY_BUCKET_MINUTES,
+        second=0,
+        microsecond=0,
+    )
+    os_cache_key = bucket.strftime("%Y%m%d%H%M")
+
     with st.spinner("Fetching OpenSky air-traffic snapshot over Iran…"):
-        bucket = end_dt.replace(minute=(end_dt.minute // 10) * 10, second=0, microsecond=0)
-        os_cache_key = bucket.strftime("%Y%m%d%H%M")
-        count, air_msg = fetch_opensky_states_bbox(
+        count, air_msg = fetch_opensky_states_bbox_safe(
             cache_key=os_cache_key,
             lamin=IR_LAMIN,
             lamax=IR_LAMAX,
             lomin=IR_LOMIN,
             lomax=IR_LOMAX,
         )
-        airborne_over_iran = int(count)
 
+    # Only store/update baseline if we got a real measurement
+    if count is not None:
+        airborne_over_iran = int(count)
         insert_flight_sample(end_dt, airborne_over_iran)
         flight_z, df24 = compute_flight_z_baselined(
             now_ts=end_dt,
@@ -550,18 +623,24 @@ if enable_air_signal:
             lookback_hours_for_plot=24,
         )
 
-    if flight_z is not None and not math.isnan(adjusted_latest_score):
-        raw = logit_from_0_100(adjusted_latest_score)
-        raw_adj = raw + (-w_air_traffic * float(flight_z))
-        adjusted_latest_score = logistic_0_100(raw_adj)
+        if flight_z is not None and not math.isnan(adjusted_latest_score):
+            raw = logit_from_0_100(adjusted_latest_score)
+            raw_adj = raw + (-w_air_traffic * float(flight_z))
+            adjusted_latest_score = logistic_0_100(raw_adj)
+    else:
+        # On failure, show recent history plot if we have it
+        df24 = read_flight_samples(hours_back=24)
 
 if not math.isnan(adjusted_latest_score):
     adjusted_latest_score = float(adjusted_latest_score) * float(mkt_mult) * float(shipping_mult)
     adjusted_latest_score = float(max(0.0, min(100.0, adjusted_latest_score)))
 
+# -----------------------------
+# Tabs
+# -----------------------------
 with tab1:
     st.info(
-        "GDELT is cached (1 hour). OpenSky snapshot is cached (~10 minutes). "
+        "GDELT is cached (1 hour). OpenSky snapshot is bucketed (~10 minutes) and protected by backoff. "
         "Market/shipping amplifiers adjust the latest score only."
     )
 
@@ -634,13 +713,7 @@ with tab1:
                         "weight": float(diplomacy_weight),
                         "effect": -float(diplomacy_weight) * float(last["diplomacy_share"]),
                     },
-                    {
-                        "component": "articles",
-                        "value": int(last["articles"]),
-                        "z": None,
-                        "weight": None,
-                        "effect": None,
-                    },
+                    {"component": "articles", "value": int(last["articles"]), "z": None, "weight": None, "effect": None},
                 ]
             )
 
@@ -732,9 +805,7 @@ with tab1:
 
 with tab2:
     st.subheader("Iran air-traffic signal (aggregated)")
-    st.caption(
-        "SQLite persists aggregate airborne counts so anomaly detection uses a stable baseline across restarts."
-    )
+    st.caption("SQLite persists aggregate airborne counts so anomaly detection uses a stable baseline across restarts.")
     st.write(f"Bounding box (Iran): lat {IR_LAMIN}–{IR_LAMAX}, lon {IR_LOMIN}–{IR_LOMAX}.")
     st.write(air_msg)
 
