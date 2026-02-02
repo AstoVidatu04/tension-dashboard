@@ -2,7 +2,7 @@ import math
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Optional, Tuple, List
 
 import numpy as np
 import pandas as pd
@@ -10,18 +10,27 @@ import plotly.express as px
 import requests
 import streamlit as st
 
+# New helpers (you said you already created these)
+from gdelt_structured import (
+    fetch_gdelt_articles as fetch_gdelt_articles_structured,
+    dedupe_syndication,
+    source_diversity_factor,
+    structured_signal_score,
+)
+from market_stress import market_amplifier
+
 
 # =============================
 # App config
 # =============================
 st.set_page_config(page_title="USA–Iran Tension Dashboard", layout="wide")
 
-GDELT_DOCS_API = "https://api.gdeltproject.org/api/v2/doc/doc"
 
 DEFAULT_WINDOW_DAYS = 30
 DEFAULT_MAXRECORDS = 250
 
-EXPECTED_ARTICLE_COLS = ["datetime", "title", "url", "domain", "language", "sourceCountry"]
+# Optional second signal (aggregated) – can be toggled in sidebar
+DEFAULT_SHIPPING_QUERY = '("Red Sea" OR "Strait of Hormuz" OR tanker OR shipping OR container) AND (disruption OR attack OR reroute OR risk OR insurance)'
 
 
 # =============================
@@ -29,15 +38,6 @@ EXPECTED_ARTICLE_COLS = ["datetime", "title", "url", "domain", "language", "sour
 # =============================
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
-
-
-def fmt_gdelt_dt(dt: datetime) -> str:
-    return dt.astimezone(timezone.utc).strftime("%Y%m%d%H%M%S")
-
-
-def safe_is_json_response(r: requests.Response) -> bool:
-    ctype = (r.headers.get("content-type") or "").lower()
-    return "application/json" in ctype or "json" in ctype
 
 
 def zscore(series: pd.Series) -> pd.Series:
@@ -53,26 +53,24 @@ def logistic_0_100(x: float) -> float:
 
 
 def logit_from_0_100(score_0_100: float) -> float:
-    """
-    Convert 0-100 score back to logit space so we can add extra signals.
-    """
     eps = 1e-6
     p = min(max(score_0_100 / 100.0, eps), 1.0 - eps)
     return math.log(p / (1.0 - p))
 
 
-def empty_articles_df() -> pd.DataFrame:
-    return pd.DataFrame(columns=EXPECTED_ARTICLE_COLS)
+def safe_is_json_response(r: requests.Response) -> bool:
+    ctype = (r.headers.get("content-type") or "").lower()
+    return "application/json" in ctype or "json" in ctype
 
 
 def parse_any_datetime(value: object) -> Optional[datetime]:
     if value is None:
         return None
-
     s = str(value).strip()
     if not s:
         return None
 
+    # GDELT-style numeric timestamp
     if s.isdigit() and len(s) >= 14:
         try:
             return datetime.strptime(s[:14], "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
@@ -88,226 +86,151 @@ def parse_any_datetime(value: object) -> Optional[datetime]:
         return None
 
 
-def get_secret(key: str) -> str:
-    if key in st.secrets:
-        return str(st.secrets[key])
-
-    import os
-    v = os.environ.get(key)
-    if v:
-        return v
-
-    raise RuntimeError(f"Missing secret: {key}. Add it in Streamlit Secrets.")
-
-
-# =============================
-# Lightweight headline classifier (GDELT)
-# =============================
-KEYWORDS: Dict[str, List[str]] = {
-    "hostile": [
-        "attack", "strike", "missile", "drone", "retaliat", "threat", "warn", "kill",
-        "sanction", "terror", "proxy", "explosion", "intercept", "airstrike", "bomb",
-        "assault", "raid", "escalat", "clash"
-    ],
-    "military": [
-        "military", "navy", "fleet", "carrier", "bases", "troops", "pentagon",
-        "deployment", "exercise", "drill", "air force", "marines", "submarine",
-        "gulf", "strait of hormuz", "defense ministry", "weapon", "arms"
-    ],
-    "diplomacy": [
-        "talks", "deal", "negotiat", "diplom", "envoy", "meeting", "agreement",
-        "ceasefire", "de-escalat", "backchannel", "dialogue", "summit", "mediation"
-    ],
-}
-
-
-def classify_title(title: str) -> Dict[str, int]:
-    t = (title or "").lower()
-    return {k: int(any(w in t for w in words)) for k, words in KEYWORDS.items()}
+def shift_detected(series: List[float], recent: int = 7, prior: int = 21, z: float = 1.2) -> bool:
+    """
+    Simple regime-shift detector: compare mean of last `recent` vs previous `prior`.
+    """
+    if series is None or len(series) < (recent + prior):
+        return False
+    s = np.array(series, dtype=float)
+    r = s[-recent:]
+    p = s[-(recent + prior) : -recent]
+    if p.std() == 0:
+        return False
+    return abs(r.mean() - p.mean()) / p.std() >= z
 
 
 # =============================
-# GDELT fetcher (robust + rate-limit aware)
+# GDELT Structured: caching wrapper
 # =============================
-@dataclass
-class FetchResult:
-    df: pd.DataFrame
-    status: str   # "ok" | "error"
-    detail: str
-
-
-def _gdelt_request(params: dict, timeout: int = 30) -> Tuple[Optional[dict], Optional[str]]:
-    try:
-        r = requests.get(
-            GDELT_DOCS_API,
-            params=params,
-            timeout=timeout,
-            headers={"User-Agent": "tension-dashboard/1.0"},
-        )
-    except requests.RequestException as e:
-        return None, f"Network error: {e}"
-
-    if r.status_code == 429:
-        return None, "GDELT rate limit reached (HTTP 429). Please wait a moment and try again."
-
-    if r.status_code != 200:
-        snippet = (r.text or "")[:220].replace("\n", " ").strip()
-        return None, f"GDELT HTTP {r.status_code}. Response snippet: {snippet}"
-
-    if not safe_is_json_response(r):
-        snippet = (r.text or "")[:220].replace("\n", " ").strip()
-        return None, f"GDELT returned non-JSON content. Snippet: {snippet}"
-
-    try:
-        return r.json(), None
-    except ValueError:
-        snippet = (r.text or "")[:220].replace("\n", " ").strip()
-        return None, f"Failed to parse JSON. Snippet: {snippet}"
-
-
 @st.cache_data(ttl=60 * 60, show_spinner=False)
-def fetch_gdelt_articles(
-    query: str,
-    start_dt: datetime,
-    end_dt: datetime,
-    maxrecords: int,
-    cache_key: str,
-) -> FetchResult:
-    params = {
-        "query": query,
-        "mode": "ArtList",
-        "format": "json",
-        "startdatetime": fmt_gdelt_dt(start_dt),
-        "enddatetime": fmt_gdelt_dt(end_dt),
-        "maxrecords": int(maxrecords),
-        "sort": "HybridRel",
-    }
-
-    data, err = _gdelt_request(params)
-    if err:
-        if "429" not in err:
-            time.sleep(0.7)
-            data, err = _gdelt_request(params)
-        if err:
-            return FetchResult(empty_articles_df(), "error", err)
-
-    articles = (data or {}).get("articles", [])
-    if not articles:
-        return FetchResult(empty_articles_df(), "ok", "No articles returned for that window/query.")
-
-    ts_keys = ["seendate", "seenDate", "seen_date", "datetime", "date"]
-
-    rows = []
-    skipped_no_ts = 0
-    skipped_unparseable_ts = 0
-
-    for a in articles:
-        ts_val = None
-        for k in ts_keys:
-            if a.get(k):
-                ts_val = a.get(k)
-                break
-
-        if ts_val is None:
-            skipped_no_ts += 1
-            continue
-
-        dt = parse_any_datetime(ts_val)
-        if dt is None:
-            skipped_unparseable_ts += 1
-            continue
-
-        rows.append(
-            {
-                "datetime": dt,
-                "title": a.get("title") or "",
-                "url": a.get("url") or "",
-                "domain": a.get("domain") or "",
-                "language": a.get("language") or "",
-                "sourceCountry": a.get("sourceCountry") or a.get("sourcecountry") or "",
-            }
-        )
-
-    if not rows:
-        detail = (
-            "GDELT returned matches, but none had a parseable timestamp. "
-            f"Skipped: no timestamp field={skipped_no_ts}, unparseable timestamp={skipped_unparseable_ts}."
-        )
-        return FetchResult(empty_articles_df(), "ok", detail)
-
-    df = pd.DataFrame(rows, columns=EXPECTED_ARTICLE_COLS).sort_values("datetime")
-    detail = f"Fetched {len(df)} articles (skipped {skipped_no_ts + skipped_unparseable_ts})."
-    return FetchResult(df, "ok", detail)
+def cached_fetch_structured(query: str, hours_back: int, max_records: int, cache_key: str) -> pd.DataFrame:
+    # cache_key is included only to allow manual refresh busting
+    _ = cache_key
+    df = fetch_gdelt_articles_structured(query=query, hours_back=hours_back, max_records=max_records)
+    return df
 
 
-# =============================
-# Feature engineering + scoring (GDELT)
-# =============================
-def build_daily_features(df_articles: pd.DataFrame) -> pd.DataFrame:
-    if df_articles.empty:
-        return pd.DataFrame(columns=["date", "articles", "hostile", "military", "diplomacy"])
+def build_daily_structured_features(df_articles: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build daily time series using tone + (optional) themes.
 
-    tmp = df_articles.copy()
-    tmp["date"] = pd.to_datetime(tmp["datetime"], utc=True).dt.date
+    Output columns:
+      date, articles, tension_core, diplomacy_share
+    """
+    if df_articles is None or df_articles.empty:
+        return pd.DataFrame(columns=["date", "articles", "tension_core", "diplomacy_share"])
 
-    labels = tmp["title"].apply(classify_title).apply(pd.Series)
-    tmp = pd.concat([tmp, labels], axis=1)
+    df = df_articles.copy()
+
+    # ensure seendate exists & parsed
+    if "seendate" in df.columns:
+        df["datetime"] = pd.to_datetime(df["seendate"], errors="coerce", utc=True)
+    elif "datetime" in df.columns:
+        df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce", utc=True)
+    else:
+        df["datetime"] = pd.NaT
+
+    df = df.dropna(subset=["datetime"]).copy()
+    if df.empty:
+        return pd.DataFrame(columns=["date", "articles", "tension_core", "diplomacy_share"])
+
+    df["date"] = df["datetime"].dt.date
+
+    # tone parsing/clipping
+    tone = pd.to_numeric(df.get("tone", pd.Series([np.nan] * len(df))), errors="coerce").clip(-10, 10)
+    df["tone_num"] = tone
+
+    # diplomacy themes (if themes_list exists)
+    dip_keywords = {"NEGOTIATIONS", "MEDIATION", "DIPLOMACY", "PEACE", "CEASEFIRE", "TREATY"}
+
+    def is_diplomatic(themes):
+        if not isinstance(themes, list):
+            return False
+        tset = {t.strip().upper() for t in themes if isinstance(t, str) and t.strip()}
+        return any(any(k in t for k in dip_keywords) for t in tset)
+
+    if "themes_list" in df.columns:
+        df["is_diplomatic"] = df["themes_list"].apply(is_diplomatic).astype(int)
+    else:
+        df["is_diplomatic"] = 0
+
+    def tension_core_for_group(g: pd.DataFrame) -> float:
+        t = g["tone_num"].dropna()
+        if t.empty:
+            return 0.0
+        neg_mass = (-t[t < 0]).sum()
+        n = max(len(g), 1)
+        return float(neg_mass / n)
 
     daily = (
-        tmp.groupby("date", as_index=False)
+        df.groupby("date", as_index=False)
         .agg(
-            articles=("title", "count"),
-            hostile=("hostile", "sum"),
-            military=("military", "sum"),
-            diplomacy=("diplomacy", "sum"),
+            articles=("url", "count"),
+            diplomacy_share=("is_diplomatic", "mean"),
         )
         .sort_values("date")
     )
 
-    all_days = pd.date_range(daily["date"].min(), daily["date"].max(), freq="D").date
-    daily = daily.set_index("date").reindex(all_days).fillna(0).rename_axis("date").reset_index()
+    # tension_core needs custom aggregation
+    cores = df.groupby("date").apply(tension_core_for_group).reset_index(name="tension_core")
+    daily = daily.merge(cores, on="date", how="left")
 
-    for c in ["articles", "hostile", "military", "diplomacy"]:
-        daily[c] = daily[c].astype(int)
+    # fill missing days
+    all_days = pd.date_range(daily["date"].min(), daily["date"].max(), freq="D").date
+    daily = daily.set_index("date").reindex(all_days).rename_axis("date").reset_index()
+
+    daily["articles"] = daily["articles"].fillna(0).astype(int)
+    daily["diplomacy_share"] = daily["diplomacy_share"].fillna(0.0).astype(float)
+    daily["tension_core"] = daily["tension_core"].fillna(0.0).astype(float)
 
     return daily
 
 
-def compute_score(
+def compute_structured_score_series(
     daily: pd.DataFrame,
-    w_hostile: float,
-    w_military: float,
-    w_diplomacy: float,
     smooth_days: int,
+    diplomacy_weight: float,
 ) -> pd.DataFrame:
-    if daily.empty:
-        return daily.assign(score=np.nan)
+    """
+    Convert daily tension_core (+ diplomacy_share adjustment) into a 0–100 score.
+    We use z-scored smoothed tension_core as the base, then subtract diplomacy share.
+    """
+    if daily is None or daily.empty:
+        return pd.DataFrame(columns=list(daily.columns) + ["score"])
 
     d = daily.copy()
 
-    for c in ["hostile", "military", "diplomacy"]:
-        d[f"{c}_sm"] = d[c].rolling(window=smooth_days, min_periods=1).mean()
+    d["tension_sm"] = d["tension_core"].rolling(window=smooth_days, min_periods=1).mean()
+    d["z_tension"] = zscore(d["tension_sm"])
 
-    d["z_hostile"] = zscore(d["hostile_sm"])
-    d["z_military"] = zscore(d["military_sm"])
-    d["z_diplomacy"] = zscore(d["diplomacy_sm"])
-
-    raw = (w_hostile * d["z_hostile"]) + (w_military * d["z_military"]) - (w_diplomacy * d["z_diplomacy"])
-    # raw is a Series here, convert elementwise to 0-100
+    raw = d["z_tension"] - (diplomacy_weight * d["diplomacy_share"])
     d["score"] = (100.0 * (1.0 / (1.0 + np.exp(-raw)))).astype(float)
 
     return d
 
 
 # =============================
-# OpenSky OAuth2 + Iran airspace aggregate
+# OpenSky OAuth2 + Iran airspace aggregate (unchanged)
 # =============================
 OPENSKY_STATES_URL = "https://opensky-network.org/api/states/all"
 OPENSKY_TOKEN_URL = "https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token"
 
 
+def get_secret(key: str) -> str:
+    if key in st.secrets:
+        return str(st.secrets[key])
+    import os
+
+    v = os.environ.get(key)
+    if v:
+        return v
+    raise RuntimeError(f"Missing secret: {key}. Add it in Streamlit Secrets.")
+
+
 @st.cache_data(ttl=50 * 60, show_spinner=False)
 def fetch_opensky_token(cache_key: str) -> Tuple[Optional[str], str]:
+    _ = cache_key
     try:
         client_id = get_secret("OPENSKY_CLIENT_ID")
         client_secret = get_secret("OPENSKY_CLIENT_SECRET")
@@ -332,15 +255,13 @@ def fetch_opensky_token(cache_key: str) -> Tuple[Optional[str], str]:
         snippet = (r.text or "")[:220].replace("\n", " ").strip()
         return None, f"OpenSky token HTTP {r.status_code}. Snippet: {snippet}"
 
-    try:
-        js = r.json()
-    except ValueError:
+    if not safe_is_json_response(r):
         return None, "OpenSky token endpoint returned non-JSON."
 
+    js = r.json()
     token = js.get("access_token")
     if not token:
         return None, "OpenSky token response missing access_token."
-
     return token, "OpenSky token acquired."
 
 
@@ -352,11 +273,6 @@ def fetch_opensky_states_bbox(
     lomin: float,
     lomax: float,
 ) -> Tuple[int, str]:
-    """
-    Fetch ONE snapshot within a bounding box and return an aggregate count:
-    number of airborne state vectors in bbox.
-    Bounding box filtering is supported by /states/all via lamin/lamax/lomin/lomax. :contentReference[oaicite:1]{index=1}
-    """
     token, msg = fetch_opensky_token("token-" + cache_key)
     if not token:
         return 0, msg
@@ -376,11 +292,10 @@ def fetch_opensky_states_bbox(
         snippet = (r.text or "")[:220].replace("\n", " ").strip()
         return 0, f"OpenSky HTTP {r.status_code}. Snippet: {snippet}"
 
-    try:
-        js = r.json()
-    except ValueError:
+    if not safe_is_json_response(r):
         return 0, "OpenSky returned non-JSON response."
 
+    js = r.json()
     states = js.get("states") or []
     if not states:
         return 0, f"{msg} OpenSky returned 0 states in bbox."
@@ -397,23 +312,14 @@ def fetch_opensky_states_bbox(
 
 
 def update_flight_history(sample_ts: datetime, airborne_count: int):
-    """
-    Store aggregate samples in session memory.
-    """
     if "iran_flight_samples" not in st.session_state:
         st.session_state["iran_flight_samples"] = []
 
     st.session_state["iran_flight_samples"].append({"ts": sample_ts, "airborne": int(airborne_count)})
-
-    # keep last ~48h worth if sampled every few minutes; cap list to stay safe
     st.session_state["iran_flight_samples"] = st.session_state["iran_flight_samples"][-500:]
 
 
 def compute_flight_z_last_24h(now_ts: datetime) -> Tuple[Optional[float], pd.DataFrame]:
-    """
-    Compute z-score of latest airborne count vs last 24h of in-session samples.
-    Returns (z, df_samples_24h)
-    """
     samples = st.session_state.get("iran_flight_samples", [])
     if not samples:
         return None, pd.DataFrame(columns=["ts", "airborne"])
@@ -436,31 +342,33 @@ def compute_flight_z_last_24h(now_ts: datetime) -> Tuple[Optional[float], pd.Dat
 # UI
 # =============================
 st.title("USA–Iran Tension Dashboard")
-st.caption("News-derived tension indicator (GDELT) + aggregate air-traffic signal over Iran (OpenSky).")
+st.caption("Structured news-derived tension indicator (GDELT) + aggregate air-traffic signal over Iran (OpenSky).")
 
 tab1, tab2 = st.tabs(["Tension dashboard", "Air traffic signal"])
 
 # Sidebar controls (shared)
 with st.sidebar:
     st.header("GDELT")
-    default_query = "(United States OR USA OR US) (Iran OR Iranian)"
+    default_query = '(United States OR USA OR US) (Iran OR Iranian)'
     query = st.text_input("GDELT query", value=default_query)
 
     window_days = st.slider("Lookback (days)", 7, 180, DEFAULT_WINDOW_DAYS)
     maxrecords = st.slider("Max articles to fetch", 50, 250, DEFAULT_MAXRECORDS, step=25)
 
-    st.header("Scoring weights")
-    w_hostile = st.slider("Hostile (↑)", 0.0, 5.0, 2.0, 0.1)
-    w_military = st.slider("Military (↑)", 0.0, 5.0, 1.5, 0.1)
-    w_diplomacy = st.slider("Diplomacy (↓)", 0.0, 5.0, 1.0, 0.1)
+    st.header("Structured scoring")
     smooth_days = st.slider("Smoothing (days)", 1, 14, 3)
+    diplomacy_weight = st.slider("Diplomacy dampening", 0.0, 2.0, 0.5, 0.1)
+
+    st.header("Amplifiers (latest score only)")
+    enable_market_amp = st.checkbox("Enable market stress amplifier (oil/VIX)", value=True)
+    enable_shipping_amp = st.checkbox("Enable shipping disruption news amplifier", value=False)
+    shipping_query = st.text_input("Shipping query (GDELT)", value=DEFAULT_SHIPPING_QUERY)
 
     st.header("Air traffic signal")
     enable_air_signal = st.checkbox("Enable Iran air-traffic signal", value=True)
-    # Interpretation: if traffic DROPS vs baseline -> risk should INCREASE
     w_air_traffic = st.slider("Air traffic impact (↑ when traffic drops)", 0.0, 3.0, 1.0, 0.1)
 
-    st.caption("This uses an aggregate count of airborne aircraft within an Iran bounding box (no per-aircraft listing).")
+    st.caption("Air traffic uses an aggregate airborne count in an Iran bounding box (no per-aircraft listing).")
 
     st.header("Controls")
     refresh = st.button("Refresh now")
@@ -481,40 +389,65 @@ if refresh:
         cache_key = utc_now().strftime("%Y%m%d%H%M%S")
 
 
-# --- Fetch GDELT ---
+# --- Fetch GDELT structured ---
 end_dt = utc_now()
-start_dt = end_dt - timedelta(days=int(window_days))
+hours_back = int(window_days) * 24
 
 with st.spinner("Fetching GDELT articles…"):
-    fetch = fetch_gdelt_articles(
-        query=query,
-        start_dt=start_dt,
-        end_dt=end_dt,
-        maxrecords=maxrecords,
-        cache_key=cache_key,
-    )
+    articles = cached_fetch_structured(query=query, hours_back=hours_back, max_records=maxrecords, cache_key=cache_key)
 
-if "last_good_df" not in st.session_state:
-    st.session_state["last_good_df"] = empty_articles_df()
+# De-dup syndication
+articles = dedupe_syndication(articles) if articles is not None else pd.DataFrame()
 
-if fetch.status == "error":
-    st.warning(fetch.detail)
-    articles = st.session_state["last_good_df"]
-    detail_msg = "Showing last cached data."
-else:
-    articles = fetch.df
-    detail_msg = fetch.detail
-    if not articles.empty:
-        st.session_state["last_good_df"] = articles
+# Global diversity and uncertainty estimates for the latest window
+div_mult = source_diversity_factor(articles) if not articles.empty else 0.8
+sig = structured_signal_score(articles) if not articles.empty else {"tension_core": 0.0, "diplomacy_share": 0.0, "uncertainty": 1.0}
 
-daily = build_daily_features(articles)
-scored = compute_score(daily, w_hostile, w_military, w_diplomacy, smooth_days=smooth_days)
+daily = build_daily_structured_features(articles)
+scored = compute_structured_score_series(daily, smooth_days=smooth_days, diplomacy_weight=diplomacy_weight)
 
 base_latest_score = float(scored["score"].iloc[-1]) if len(scored) else float("nan")
 
+# Apply diversity multiplier in logit space (gentle)
+# (This avoids the score jumping too hard; it’s a nudge, not a takeover.)
+if not math.isnan(base_latest_score):
+    raw = logit_from_0_100(base_latest_score)
+    raw *= float(div_mult)
+    base_latest_score = logistic_0_100(raw)
+
+# Uncertainty band for latest score
+band = int(round(8 * float(sig.get("uncertainty", 1.0))))
+low_band = None
+high_band = None
+if not math.isnan(base_latest_score):
+    low_band = max(0, int(round(base_latest_score - band)))
+    high_band = min(100, int(round(base_latest_score + band)))
+
+# Regime-shift detection on the base time series
+shift_flag = False
+if not scored.empty:
+    shift_flag = shift_detected(scored["score"].astype(float).tolist())
+
+# --- Shipping disruption amplifier (aggregated volume only; latest-only) ---
+shipping_mult = 1.0
+shipping_articles_count = 0
+if enable_shipping_amp:
+    with st.spinner("Fetching shipping disruption volume…"):
+        ship_df = cached_fetch_structured(query=shipping_query, hours_back=72, max_records=250, cache_key="ship-" + cache_key)
+    ship_df = dedupe_syndication(ship_df) if ship_df is not None else pd.DataFrame()
+    shipping_articles_count = int(len(ship_df))
+
+    if shipping_articles_count >= 40:
+        shipping_mult = 1.05
+    if shipping_articles_count >= 80:
+        shipping_mult = 1.10
+
+# --- Market amplifier (latest-only) ---
+mkt_mult = 1.0
+if enable_market_amp:
+    mkt_mult = float(market_amplifier())
 
 # --- Fetch OpenSky Iran bbox aggregate (ONE call) ---
-# A practical bbox covering Iran (city ranges roughly: lat 25.29–39.65, lon 44.77–61.49). :contentReference[oaicite:2]{index=2}
 IR_LAMIN, IR_LAMAX = 25.29, 39.65
 IR_LOMIN, IR_LOMAX = 44.77, 61.49
 
@@ -522,11 +455,11 @@ airborne_over_iran = None
 air_msg = "Air traffic signal disabled."
 flight_z = None
 df24 = pd.DataFrame(columns=["ts", "airborne"])
+
 adjusted_latest_score = base_latest_score
 
 if enable_air_signal:
     with st.spinner("Fetching OpenSky air-traffic snapshot over Iran…"):
-        # Round cache key to 10-minute buckets to reduce repeated token/state requests
         bucket = end_dt.replace(minute=(end_dt.minute // 10) * 10, second=0, microsecond=0)
         os_cache_key = bucket.strftime("%Y%m%d%H%M")
         count, air_msg = fetch_opensky_states_bbox(
@@ -540,12 +473,16 @@ if enable_air_signal:
         update_flight_history(end_dt, airborne_over_iran)
         flight_z, df24 = compute_flight_z_last_24h(end_dt)
 
-    # Adjust only if we have enough history to compute a meaningful z-score
-    if flight_z is not None and not math.isnan(base_latest_score):
-        raw = logit_from_0_100(base_latest_score)
+    if flight_z is not None and not math.isnan(adjusted_latest_score):
+        raw = logit_from_0_100(adjusted_latest_score)
         # Traffic drop -> negative z. We want that to INCREASE risk => subtract z * weight.
         raw_adj = raw + (-w_air_traffic * float(flight_z))
         adjusted_latest_score = logistic_0_100(raw_adj)
+
+# Apply latest-only amplifiers (market + shipping) after air adjustment
+if not math.isnan(adjusted_latest_score):
+    adjusted_latest_score = float(adjusted_latest_score) * float(mkt_mult) * float(shipping_mult)
+    adjusted_latest_score = float(max(0.0, min(100.0, adjusted_latest_score)))
 
 
 # =============================
@@ -555,19 +492,37 @@ with tab1:
     st.info(
         "GDELT is cached (1 hour) to avoid rate limits. "
         "OpenSky air-traffic snapshot is cached (~10 minutes). "
-        "The air-traffic signal adjusts the **latest** score only (session baseline)."
+        "Market/shipping amplifiers adjust the **latest** score only."
     )
 
-    if detail_msg:
-        st.write(detail_msg)
+    if shift_flag:
+        st.warning("Regime shift detected: the last week differs materially from the prior baseline.")
 
     # KPIs
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Base risk score (latest)", "—" if math.isnan(base_latest_score) else f"{base_latest_score:.1f}/100")
-    c2.metric("Adjusted score (latest)", "—" if math.isnan(adjusted_latest_score) else f"{adjusted_latest_score:.1f}/100")
-    c3.metric("Articles fetched", f"{len(articles)}")
+
+    base_str = "—" if math.isnan(base_latest_score) else f"{base_latest_score:.1f}/100"
+    adj_str = "—" if math.isnan(adjusted_latest_score) else f"{adjusted_latest_score:.1f}/100"
+
+    c1.metric("Base risk score (latest)", base_str)
+    c2.metric("Adjusted score (latest)", adj_str)
+    c3.metric("Articles (deduped)", f"{len(articles)}")
     c4.metric("Window", f"{window_days} days")
     c5.metric("Updated (UTC)", end_dt.strftime("%Y-%m-%d %H:%M"))
+
+    # Uncertainty band + signal notes
+    b1, b2, b3, b4 = st.columns(4)
+    if low_band is None or high_band is None:
+        b1.metric("Uncertainty band", "—")
+    else:
+        b1.metric("Uncertainty band", f"{low_band}–{high_band}")
+
+    b2.metric("Source diversity multiplier", f"{div_mult:.2f}")
+    b3.metric("Market amplifier", f"{mkt_mult:.2f}" if enable_market_amp else "off")
+    if enable_shipping_amp:
+        b4.metric("Shipping amp", f"{shipping_mult:.2f} ({shipping_articles_count} arts)")
+    else:
+        b4.metric("Shipping amp", "off")
 
     st.caption(f"OpenSky: {air_msg}")
 
@@ -582,50 +537,76 @@ with tab1:
     left, right = st.columns([1.25, 1])
 
     with left:
-        st.subheader("Risk score over time (base)")
+        st.subheader("Risk score over time (structured)")
         if scored.empty:
             st.info("No usable articles in this window. Try a longer window or loosen the query.")
         else:
             fig = px.line(scored, x="date", y="score")
             st.plotly_chart(fig, use_container_width=True)
 
-        st.subheader("Signal volumes (daily)")
+        st.subheader("Structured drivers (daily)")
         if not scored.empty:
             melted = scored.melt(
                 id_vars=["date"],
-                value_vars=["hostile", "military", "diplomacy"],
+                value_vars=["tension_core", "diplomacy_share", "articles"],
                 var_name="signal",
-                value_name="count",
+                value_name="value",
             )
-            fig2 = px.line(melted, x="date", y="count", color="signal")
+            fig2 = px.line(melted, x="date", y="value", color="signal")
             st.plotly_chart(fig2, use_container_width=True)
 
     with right:
-        st.subheader("Latest-day drivers (base)")
+        st.subheader("Latest-day drivers (structured)")
         if scored.empty:
             st.write("—")
         else:
             last = scored.iloc[-1]
             drivers = pd.DataFrame(
                 [
-                    {"component": "hostile", "value": last["hostile"], "z": last["z_hostile"], "weight": w_hostile, "effect": w_hostile * last["z_hostile"]},
-                    {"component": "military", "value": last["military"], "z": last["z_military"], "weight": w_military, "effect": w_military * last["z_military"]},
-                    {"component": "diplomacy", "value": last["diplomacy"], "z": last["z_diplomacy"], "weight": w_diplomacy, "effect": -w_diplomacy * last["z_diplomacy"]},
+                    {
+                        "component": "tension_core (tone)",
+                        "value": float(last["tension_core"]),
+                        "z": float(last["z_tension"]),
+                        "weight": 1.0,
+                        "effect": float(last["z_tension"]),
+                    },
+                    {
+                        "component": "diplomacy_share",
+                        "value": float(last["diplomacy_share"]),
+                        "z": None,
+                        "weight": float(diplomacy_weight),
+                        "effect": -float(diplomacy_weight) * float(last["diplomacy_share"]),
+                    },
+                    {
+                        "component": "articles",
+                        "value": int(last["articles"]),
+                        "z": None,
+                        "weight": None,
+                        "effect": None,
+                    },
                 ]
-            ).sort_values("effect", ascending=False)
-
+            )
             st.dataframe(drivers, use_container_width=True, hide_index=True)
 
         st.subheader("Latest matching articles")
         if articles.empty:
             st.write("—")
         else:
-            latest = articles.sort_values("datetime", ascending=False).head(20)
+            # Prefer seendate if present
+            if "seendate" in articles.columns:
+                tmp = articles.copy()
+                tmp["dt"] = pd.to_datetime(tmp["seendate"], errors="coerce", utc=True)
+            else:
+                tmp = articles.copy()
+                tmp["dt"] = pd.NaT
+
+            latest = tmp.sort_values("dt", ascending=False).head(20)
             for _, row in latest.iterrows():
-                dt_str = pd.to_datetime(row["datetime"], utc=True).strftime("%Y-%m-%d %H:%M UTC")
-                title = row["title"] or "(no title)"
-                url = row["url"] or ""
-                domain = row.get("domain", "")
+                dt = row.get("dt")
+                dt_str = dt.strftime("%Y-%m-%d %H:%M UTC") if pd.notna(dt) else "—"
+                title = row.get("title") or "(no title)"
+                url = row.get("url") or ""
+                domain = row.get("domain") or ""
                 st.markdown(f"- [{title}]({url})  \n  *{dt_str} · {domain}*")
 
     st.divider()
