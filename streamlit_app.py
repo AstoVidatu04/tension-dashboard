@@ -1,6 +1,5 @@
 import math
 import time
-import textwrap
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional, Tuple, List
@@ -9,8 +8,6 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-import json
-from plotly.utils import PlotlyJSONEncoder
 import requests
 import sqlite3
 import streamlit as st
@@ -90,7 +87,47 @@ def fmt_optional(x):
     return x
 
 
-def risk_meter(score: float, title: str):
+def classify_risk(score: float) -> Tuple[str, str]:
+    if score is None or (isinstance(score, float) and math.isnan(score)):
+        return "NO DATA", "#6b7280"
+    s = float(score)
+    if s < 25:
+        return "LOW RISK", "#22c55e"
+    if s < 50:
+        return "GUARDED", "#eab308"
+    if s < 75:
+        return "ELEVATED", "#f97316"
+    return "HIGH RISK", "#ef4444"
+
+
+def make_compact_gauge(score: float, color: str) -> go.Figure:
+    val = 0.0 if score is None or (isinstance(score, float) and math.isnan(score)) else float(score)
+
+    fig = go.Figure(
+        go.Indicator(
+            mode="gauge",
+            value=val,
+            gauge={
+                "shape": "angular",
+                "axis": {"range": [0, 100], "visible": False},
+                "bar": {"color": color, "thickness": 0.30},
+                "bgcolor": "rgba(0,0,0,0)",
+                "borderwidth": 0,
+                "steps": [{"range": [0, 100], "color": "rgba(255,255,255,0.08)"}],
+            },
+            domain={"x": [0, 1], "y": [0, 1]},
+        )
+    )
+    fig.update_layout(
+        height=200,
+        margin=dict(l=10, r=10, t=0, b=0),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+    )
+    return fig
+
+
+def risk_meter(score: float, title: str) -> go.Figure:
     if score is None or (isinstance(score, float) and math.isnan(score)):
         val = 0.0
         suffix = ""
@@ -129,61 +166,7 @@ def risk_meter(score: float, title: str):
     return fig
 
 
-def classify_risk(score: float) -> Tuple[str, str]:
-    if score is None or (isinstance(score, float) and math.isnan(score)):
-        return "NO DATA", "#6b7280"
-    s = float(score)
-    if s < 25:
-        return "LOW RISK", "#22c55e"
-    if s < 50:
-        return "GUARDED", "#eab308"
-    if s < 75:
-        return "ELEVATED", "#f97316"
-    return "HIGH RISK", "#ef4444"
-
-
-def radar_gauge(score: float, color: str):
-    val = 0.0 if score is None or (isinstance(score, float) and math.isnan(score)) else float(score)
-    fig = go.Figure(
-        go.Indicator(
-            mode="gauge+number",
-            value=val,
-            number={"suffix": "/100", "font": {"size": 60}},
-            gauge={
-                "axis": {"range": [0, 100], "tickwidth": 0, "ticks": ""},
-                "bar": {"color": color, "thickness": 0.32},
-                "bgcolor": "rgba(0,0,0,0)",
-                "borderwidth": 0,
-                "steps": [
-                    {"range": [0, 25], "color": "rgba(34,197,94,0.16)"},
-                    {"range": [25, 50], "color": "rgba(234,179,8,0.16)"},
-                    {"range": [50, 75], "color": "rgba(249,115,22,0.16)"},
-                    {"range": [75, 100], "color": "rgba(239,68,68,0.16)"},
-                ],
-            },
-            title={"text": ""},
-        )
-    )
-    fig.update_layout(
-        height=320,
-        margin=dict(l=10, r=10, t=10, b=10),
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
-        font=dict(color="white"),
-    )
-    return fig
-
-
 def radar_card(score: float, title: str, subtitle: str, updated_dt: datetime, next_update_seconds: int):
-    """
-    Compact card UI:
-    - Title + subtitle
-    - Risk pill (color changes with risk)
-    - Thin semi-gauge
-    - Big percent centered under the arc
-
-    This renders via components.html so the layout matches the reference design.
-    """
     label, color = classify_risk(score)
 
     mins_ago = int((utc_now() - updated_dt).total_seconds() // 60)
@@ -191,91 +174,84 @@ def radar_card(score: float, title: str, subtitle: str, updated_dt: datetime, ne
     ss = max(0, int(next_update_seconds % 60))
     countdown = f"{mm:02d}:{ss:02d}"
 
-    # Display as percent (0–100)
     pct = 0 if score is None or (isinstance(score, float) and math.isnan(score)) else int(round(float(score)))
 
-    # Build a lightweight Plotly gauge (no number; we overlay our own big %)
-    fig = go.Figure(
-        go.Indicator(
-            mode="gauge",
-            value=float(pct),
-            gauge={
-                "shape": "angular",
-                "axis": {"range": [0, 100], "visible": False},
-                "bar": {"color": color, "thickness": 0.28},
-                "bgcolor": "rgba(0,0,0,0)",
-                "borderwidth": 0,
-                # Background arc
-                "steps": [{"range": [0, 100], "color": "rgba(255,255,255,0.07)"}],
-            },
-            domain={"x": [0, 1], "y": [0, 1]},
+    st.markdown(
+        """
+        <style>
+          .sr-card {
+            background: rgba(255,255,255,0.04);
+            border: 1px solid rgba(255,255,255,0.08);
+            border-radius: 22px;
+            padding: 16px 16px 14px 16px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.35);
+          }
+          .sr-pill {
+            display:inline-block;
+            padding:6px 14px;
+            border-radius:999px;
+            font-weight:800;
+            font-size:12px;
+            color:#0b0b0b;
+          }
+          .sr-title {
+            font-size:13px;
+            letter-spacing:0.10em;
+            opacity:0.85;
+            text-align:center;
+          }
+          .sr-sub {
+            font-size:12px;
+            opacity:0.65;
+            margin-top:4px;
+            text-align:center;
+          }
+          .sr-top {
+            display:flex;
+            justify-content:space-between;
+            align-items:center;
+            gap:12px;
+            opacity:0.85;
+            font-size:13px;
+          }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown('<div class="sr-card">', unsafe_allow_html=True)
+
+    top_l, top_r = st.columns([1, 1])
+    with top_l:
+        st.markdown(f'<div class="sr-top">Updated <b>{mins_ago} min ago</b> · UTC</div>', unsafe_allow_html=True)
+    with top_r:
+        st.markdown(f'<div class="sr-top" style="justify-content:flex-end;">Next update in <b>{countdown}</b></div>', unsafe_allow_html=True)
+
+    st.markdown(f'<div class="sr-title">{title}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="sr-sub">{subtitle}</div>', unsafe_allow_html=True)
+
+    st.markdown(
+        f'<div style="text-align:center; margin-top:10px;"><span class="sr-pill" style="background:{color};">{label}</span></div>',
+        unsafe_allow_html=True,
+    )
+
+    # Gauge + big percent overlay (all Streamlit-native)
+    gauge_col = st.columns([1])[0]
+    with gauge_col:
+        fig = make_compact_gauge(score, color)
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.markdown(
+            f"""
+            <div style="text-align:center; margin-top:-120px;">
+              <div style="font-size:56px; font-weight:900; color:{color}; line-height:1;">{pct}%</div>
+              <div style="font-size:12px; opacity:0.65; margin-top:6px;">Projected Risk: Next 8 Hours</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
-    )
-    fig.update_layout(
-        height=170,
-        margin=dict(l=10, r=10, t=0, b=0),
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
-    )
 
-    fig_json = json.dumps(fig, cls=PlotlyJSONEncoder)
-
-    card_html = f"""
-<div style="
-  background: rgba(255,255,255,0.04);
-  border: 1px solid rgba(255,255,255,0.08);
-  border-radius: 22px;
-  padding: 16px 16px 14px 16px;
-  box-shadow: 0 10px 30px rgba(0,0,0,0.35);
-">
-  <div style="display:flex; justify-content:space-between; align-items:center; opacity:0.85; font-size:13px;">
-    <div>Updated <b>{mins_ago} min ago</b> · UTC</div>
-    <div>Next update in <b>{countdown}</b></div>
-  </div>
-
-  <div style="text-align:center; margin-top:14px;">
-    <div style="font-size:13px; letter-spacing:0.10em; opacity:0.85;">{title}</div>
-    <div style="font-size:12px; opacity:0.65; margin-top:4px;">{subtitle}</div>
-
-    <div style="
-      display:inline-block;
-      margin-top:10px;
-      padding:6px 14px;
-      border-radius:999px;
-      background:{color};
-      color:#0b0b0b;
-      font-weight:800;
-      font-size:12px;
-    ">{label}</div>
-  </div>
-
-  <div style="position:relative; margin-top:10px;">
-    <div id="risk_gauge" style="width:100%; height:170px;"></div>
-
-    <div style="
-      position:absolute;
-      left:0; right:0;
-      top:92px;
-      text-align:center;
-      font-size:56px;
-      font-weight:900;
-      color:{color};
-      line-height:1;
-    ">{pct}%</div>
-  </div>
-
-  <div style="text-align:center; font-size:12px; opacity:0.65; margin-top:6px;">
-    Projected Risk: Next 8 Hours
-  </div>
-</div>
-
-<script src="https://cdn.plot.ly/plotly-2.30.0.min.js"></script>
-<script>
-  const fig = {fig_json};
-  Plotly.newPlot("risk_gauge", fig.data, fig.layout, {{displayModeBar: false, responsive: true}});
-</script>
-"""
-    components.html(card_html, height=420)
+    st.markdown("</div>", unsafe_allow_html=True)
 
 
 def live_tick(enable: bool):
