@@ -1,6 +1,6 @@
+```python
 import math
 import time
-from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple, List
 
@@ -9,8 +9,10 @@ import pandas as pd
 import plotly.express as px
 import requests
 import streamlit as st
+import sqlite3
+from pathlib import Path
 
-# New helpers (you said you already created these)
+# New helpers
 from gdelt_structured import (
     fetch_gdelt_articles as fetch_gdelt_articles_structured,
     dedupe_syndication,
@@ -25,12 +27,13 @@ from market_stress import market_amplifier
 # =============================
 st.set_page_config(page_title="USA–Iran Tension Dashboard", layout="wide")
 
-
 DEFAULT_WINDOW_DAYS = 30
 DEFAULT_MAXRECORDS = 250
 
-# Optional second signal (aggregated) – can be toggled in sidebar
-DEFAULT_SHIPPING_QUERY = '("Red Sea" OR "Strait of Hormuz" OR tanker OR shipping OR container) AND (disruption OR attack OR reroute OR risk OR insurance)'
+DEFAULT_SHIPPING_QUERY = (
+    '("Red Sea" OR "Strait of Hormuz" OR tanker OR shipping OR container) '
+    "AND (disruption OR attack OR reroute OR risk OR insurance)"
+)
 
 
 # =============================
@@ -63,33 +66,8 @@ def safe_is_json_response(r: requests.Response) -> bool:
     return "application/json" in ctype or "json" in ctype
 
 
-def parse_any_datetime(value: object) -> Optional[datetime]:
-    if value is None:
-        return None
-    s = str(value).strip()
-    if not s:
-        return None
-
-    # GDELT-style numeric timestamp
-    if s.isdigit() and len(s) >= 14:
-        try:
-            return datetime.strptime(s[:14], "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
-        except Exception:
-            pass
-
-    try:
-        dt = pd.to_datetime(s, utc=True, errors="coerce")
-        if pd.isna(dt):
-            return None
-        return dt.to_pydatetime()
-    except Exception:
-        return None
-
-
 def shift_detected(series: List[float], recent: int = 7, prior: int = 21, z: float = 1.2) -> bool:
-    """
-    Simple regime-shift detector: compare mean of last `recent` vs previous `prior`.
-    """
+    """Simple regime-shift detector: compare mean of last `recent` vs previous `prior`."""
     if series is None or len(series) < (recent + prior):
         return False
     s = np.array(series, dtype=float)
@@ -187,11 +165,7 @@ def build_daily_structured_features(df_articles: pd.DataFrame) -> pd.DataFrame:
     return daily
 
 
-def compute_structured_score_series(
-    daily: pd.DataFrame,
-    smooth_days: int,
-    diplomacy_weight: float,
-) -> pd.DataFrame:
+def compute_structured_score_series(daily: pd.DataFrame, smooth_days: int, diplomacy_weight: float) -> pd.DataFrame:
     """
     Convert daily tension_core (+ diplomacy_share adjustment) into a 0–100 score.
     We use z-scored smoothed tension_core as the base, then subtract diplomacy share.
@@ -211,7 +185,142 @@ def compute_structured_score_series(
 
 
 # =============================
-# OpenSky OAuth2 + Iran airspace aggregate (unchanged)
+# SQLite: persistent flight baseline (timestamp + aggregate count only)
+# =============================
+DB_PATH = Path(__file__).with_name("flights.db")
+
+
+def db_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH.as_posix(), check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    return conn
+
+
+def init_flights_db() -> None:
+    conn = db_conn()
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS flight_samples (
+                ts_utc TEXT PRIMARY KEY,
+                airborne INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_flight_samples_ts ON flight_samples(ts_utc)")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def insert_flight_sample(ts: datetime, airborne: int) -> None:
+    ts_utc = ts.astimezone(timezone.utc).replace(microsecond=0).isoformat()
+    conn = db_conn()
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO flight_samples(ts_utc, airborne) VALUES (?, ?)",
+            (ts_utc, int(airborne)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def read_flight_samples(hours_back: int = 24, limit: int = 5000) -> pd.DataFrame:
+    cutoff = (utc_now() - timedelta(hours=hours_back)).replace(microsecond=0).isoformat()
+    conn = db_conn()
+    try:
+        rows = conn.execute(
+            """
+            SELECT ts_utc, airborne
+            FROM flight_samples
+            WHERE ts_utc >= ?
+            ORDER BY ts_utc ASC
+            LIMIT ?
+            """,
+            (cutoff, int(limit)),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    df = pd.DataFrame(rows, columns=["ts", "airborne"])
+    if df.empty:
+        return df
+    df["ts"] = pd.to_datetime(df["ts"], utc=True, errors="coerce")
+    df = df.dropna(subset=["ts"])
+    df["airborne"] = pd.to_numeric(df["airborne"], errors="coerce").fillna(0).astype(int)
+    return df
+
+
+def prune_flights_db(keep_days: int = 120) -> int:
+    """Deletes old flight samples to keep the SQLite DB from growing forever."""
+    cutoff = (utc_now() - timedelta(days=keep_days)).replace(microsecond=0).isoformat()
+    conn = db_conn()
+    try:
+        cur = conn.execute("DELETE FROM flight_samples WHERE ts_utc < ?", (cutoff,))
+        conn.commit()
+        return int(cur.rowcount)
+    finally:
+        conn.close()
+
+
+def compute_flight_z_baselined(
+    now_ts: datetime,
+    baseline_days: int = 28,
+    min_baseline_points: int = 30,
+    lookback_hours_for_plot: int = 24,
+) -> Tuple[Optional[float], pd.DataFrame]:
+    """
+    Compute z-score of the latest airborne count relative to a baseline
+    for the same hour-of-day + day-of-week over the last `baseline_days`.
+    """
+    hours_back = baseline_days * 24
+    df = read_flight_samples(hours_back=hours_back)
+
+    if df.empty or len(df) < 10:
+        return None, read_flight_samples(hours_back=lookback_hours_for_plot)
+
+    # Latest sample
+    latest = df.iloc[-1]
+    latest_ts = latest["ts"]
+    latest_val = float(latest["airborne"])
+
+    # Baseline key (UTC)
+    dow = int(latest_ts.dayofweek)  # Monday=0
+    hour = int(latest_ts.hour)
+
+    df["dow"] = df["ts"].dt.dayofweek
+    df["hour"] = df["ts"].dt.hour
+
+    hist = df.iloc[:-1]
+    base = hist[(hist["dow"] == dow) & (hist["hour"] == hour)].copy()
+
+    if len(base) < min_baseline_points:
+        # fallback: z-score vs last 24h (still from sqlite, not session)
+        df24 = read_flight_samples(hours_back=lookback_hours_for_plot)
+        if len(df24) < 6:
+            return None, df24
+        z = float(zscore(df24["airborne"]).iloc[-1])
+        return z, df24
+
+    mu = float(base["airborne"].mean())
+    sigma = float(base["airborne"].std(ddof=0))
+    if sigma == 0.0 or np.isnan(sigma):
+        return None, read_flight_samples(hours_back=lookback_hours_for_plot)
+
+    z = (latest_val - mu) / sigma
+
+    df24 = df[df["ts"] >= (now_ts - timedelta(hours=lookback_hours_for_plot))][["ts", "airborne"]].copy()
+    return float(z), df24
+
+
+# IMPORTANT: call init AFTER it is defined
+init_flights_db()
+
+
+# =============================
+# OpenSky OAuth2 + Iran airspace aggregate
 # =============================
 OPENSKY_STATES_URL = "https://opensky-network.org/api/states/all"
 OPENSKY_TOKEN_URL = "https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token"
@@ -311,33 +420,6 @@ def fetch_opensky_states_bbox(
     return airborne, f"{msg} OpenSky bbox snapshot ok."
 
 
-def update_flight_history(sample_ts: datetime, airborne_count: int):
-    if "iran_flight_samples" not in st.session_state:
-        st.session_state["iran_flight_samples"] = []
-
-    st.session_state["iran_flight_samples"].append({"ts": sample_ts, "airborne": int(airborne_count)})
-    st.session_state["iran_flight_samples"] = st.session_state["iran_flight_samples"][-500:]
-
-
-def compute_flight_z_last_24h(now_ts: datetime) -> Tuple[Optional[float], pd.DataFrame]:
-    samples = st.session_state.get("iran_flight_samples", [])
-    if not samples:
-        return None, pd.DataFrame(columns=["ts", "airborne"])
-
-    df = pd.DataFrame(samples)
-    if df.empty:
-        return None, pd.DataFrame(columns=["ts", "airborne"])
-
-    df["ts"] = pd.to_datetime(df["ts"], utc=True)
-    cutoff = now_ts - timedelta(hours=24)
-    df24 = df[df["ts"] >= cutoff].sort_values("ts")
-    if len(df24) < 6:
-        return None, df24
-
-    z = float(zscore(df24["airborne"]).iloc[-1])
-    return z, df24
-
-
 # =============================
 # UI
 # =============================
@@ -349,7 +431,7 @@ tab1, tab2 = st.tabs(["Tension dashboard", "Air traffic signal"])
 # Sidebar controls (shared)
 with st.sidebar:
     st.header("GDELT")
-    default_query = '(United States OR USA OR US) (Iran OR Iranian)'
+    default_query = "(United States OR USA OR US) (Iran OR Iranian)"
     query = st.text_input("GDELT query", value=default_query)
 
     window_days = st.slider("Lookback (days)", 7, 180, DEFAULT_WINDOW_DAYS)
@@ -372,6 +454,12 @@ with st.sidebar:
 
     st.header("Controls")
     refresh = st.button("Refresh now")
+
+    st.subheader("Flight DB maintenance")
+    keep_days = st.number_input("Keep flight samples (days)", min_value=14, max_value=365, value=120, step=7)
+    if st.button("Prune flight DB"):
+        deleted = prune_flights_db(keep_days=int(keep_days))
+        st.success(f"Deleted {deleted} old flight samples (kept last {int(keep_days)} days).")
 
 
 # Refresh cooldown (per session)
@@ -396,10 +484,8 @@ hours_back = int(window_days) * 24
 with st.spinner("Fetching GDELT articles…"):
     articles = cached_fetch_structured(query=query, hours_back=hours_back, max_records=maxrecords, cache_key=cache_key)
 
-# De-dup syndication
 articles = dedupe_syndication(articles) if articles is not None else pd.DataFrame()
 
-# Global diversity and uncertainty estimates for the latest window
 div_mult = source_diversity_factor(articles) if not articles.empty else 0.8
 sig = structured_signal_score(articles) if not articles.empty else {"tension_core": 0.0, "diplomacy_share": 0.0, "uncertainty": 1.0}
 
@@ -409,7 +495,6 @@ scored = compute_structured_score_series(daily, smooth_days=smooth_days, diploma
 base_latest_score = float(scored["score"].iloc[-1]) if len(scored) else float("nan")
 
 # Apply diversity multiplier in logit space (gentle)
-# (This avoids the score jumping too hard; it’s a nudge, not a takeover.)
 if not math.isnan(base_latest_score):
     raw = logit_from_0_100(base_latest_score)
     raw *= float(div_mult)
@@ -423,7 +508,7 @@ if not math.isnan(base_latest_score):
     low_band = max(0, int(round(base_latest_score - band)))
     high_band = min(100, int(round(base_latest_score + band)))
 
-# Regime-shift detection on the base time series
+# Regime-shift detection
 shift_flag = False
 if not scored.empty:
     shift_flag = shift_detected(scored["score"].astype(float).tolist())
@@ -433,7 +518,9 @@ shipping_mult = 1.0
 shipping_articles_count = 0
 if enable_shipping_amp:
     with st.spinner("Fetching shipping disruption volume…"):
-        ship_df = cached_fetch_structured(query=shipping_query, hours_back=72, max_records=250, cache_key="ship-" + cache_key)
+        ship_df = cached_fetch_structured(
+            query=shipping_query, hours_back=72, max_records=250, cache_key="ship-" + cache_key
+        )
     ship_df = dedupe_syndication(ship_df) if ship_df is not None else pd.DataFrame()
     shipping_articles_count = int(len(ship_df))
 
@@ -470,8 +557,14 @@ if enable_air_signal:
             lomax=IR_LOMAX,
         )
         airborne_over_iran = int(count)
-        update_flight_history(end_dt, airborne_over_iran)
-        flight_z, df24 = compute_flight_z_last_24h(end_dt)
+
+        insert_flight_sample(end_dt, airborne_over_iran)
+        flight_z, df24 = compute_flight_z_baselined(
+            now_ts=end_dt,
+            baseline_days=28,
+            min_baseline_points=30,
+            lookback_hours_for_plot=24,
+        )
 
     if flight_z is not None and not math.isnan(adjusted_latest_score):
         raw = logit_from_0_100(adjusted_latest_score)
@@ -479,7 +572,7 @@ if enable_air_signal:
         raw_adj = raw + (-w_air_traffic * float(flight_z))
         adjusted_latest_score = logistic_0_100(raw_adj)
 
-# Apply latest-only amplifiers (market + shipping) after air adjustment
+# Apply latest-only amplifiers after air adjustment
 if not math.isnan(adjusted_latest_score):
     adjusted_latest_score = float(adjusted_latest_score) * float(mkt_mult) * float(shipping_mult)
     adjusted_latest_score = float(max(0.0, min(100.0, adjusted_latest_score)))
@@ -526,10 +619,10 @@ with tab1:
 
     st.caption(f"OpenSky: {air_msg}")
 
-    # Extra KPI row for air traffic
+    # Air traffic row
     a1, a2, a3 = st.columns(3)
     a1.metric("Airborne over Iran (snapshot)", "—" if airborne_over_iran is None else str(airborne_over_iran))
-    a2.metric("Air-traffic z-score (24h, session)", "—" if flight_z is None else f"{flight_z:+.2f}")
+    a2.metric("Air-traffic z-score (baselined)", "—" if flight_z is None else f"{flight_z:+.2f}")
     a3.metric("Air traffic weight", f"{w_air_traffic:.1f}")
 
     st.divider()
@@ -592,7 +685,6 @@ with tab1:
         if articles.empty:
             st.write("—")
         else:
-            # Prefer seendate if present
             if "seendate" in articles.columns:
                 tmp = articles.copy()
                 tmp["dt"] = pd.to_datetime(tmp["seendate"], errors="coerce", utc=True)
@@ -620,7 +712,7 @@ with tab1:
 with tab2:
     st.subheader("Iran air-traffic signal (aggregated)")
     st.caption(
-        "This tab shows the **session baseline** of airborne aircraft counts in an Iran bounding box "
+        "This tab shows the **persistent baseline** of airborne aircraft counts in an Iran bounding box "
         "and how it converts into a z-score used to adjust the latest tension score."
     )
 
@@ -628,10 +720,11 @@ with tab2:
     st.write(air_msg)
 
     if df24.empty:
-        st.info("Not enough samples yet to compute a stable 24h baseline. Leave the app running / refresh occasionally.")
+        st.info("Not enough samples yet to compute a stable baseline. Keep the app running / refresh occasionally.")
     else:
         plot_df = df24.copy()
         plot_df["ts"] = pd.to_datetime(plot_df["ts"], utc=True)
-        fig = px.line(plot_df, x="ts", y="airborne", title="Airborne aircraft over Iran (session samples, last 24h)")
+        fig = px.line(plot_df, x="ts", y="airborne", title="Airborne aircraft over Iran (SQLite samples, last 24h)")
         st.plotly_chart(fig, use_container_width=True)
         st.dataframe(plot_df.tail(50), use_container_width=True, hide_index=True)
+```
