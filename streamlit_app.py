@@ -176,7 +176,10 @@ def radar_card(score: float, title: str, subtitle: str, updated_dt: datetime, ne
     mm = max(0, int(next_update_seconds // 60))
     ss = max(0, int(next_update_seconds % 60))
     countdown = f"{mm:02d}:{ss:02d}"
-    pct = 0 if score is None or (isinstance(score, float) and math.isnan(score)) else int(round(float(score)))
+    has_data = not (score is None or (isinstance(score, float) and math.isnan(score)))
+    pct = int(round(float(score))) if has_data else None
+
+    pct_text = f"{pct}%" if pct is not None else "—"
 
     st.markdown(
         """
@@ -539,8 +542,6 @@ def cached_fetch_events(query: str, hours_back: int, max_records: int, cache_key
         "startdatetime": _fmt_gdelt_dt(start),
         "enddatetime": _fmt_gdelt_dt(end),
         "maxrecords": int(max_records),
-        "mode": "ArtList",
-        "formatdatetime": "true",
     }
     try:
         r = requests.get(GDELT_EVENTS_URL, params=params, timeout=30)
@@ -889,8 +890,8 @@ if force_update or due_update:
     d = pd.DataFrame({"date": pd.date_range(end_dt.date() - timedelta(days=window_days - 1), end_dt.date(), freq="D").date})
     d = d.merge(tone_scored[["date", "tone_score"]], on="date", how="left")
     d = d.merge(events_scored[["date", "events_score"]], on="date", how="left")
-    d["tone_score"] = d["tone_score"].fillna(method="ffill").fillna(0.0)
-    d["events_score"] = d["events_score"].fillna(method="ffill").fillna(0.0)
+    d["tone_score"] = d["tone_score"].fillna(method="ffill").fillna(50.0)
+    d["events_score"] = d["events_score"].fillna(method="ffill").fillna(50.0)
 
     # Combine in logit space so weights behave smoothly
     def safe_logit(s):
