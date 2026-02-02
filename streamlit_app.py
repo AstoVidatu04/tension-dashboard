@@ -1,5 +1,6 @@
 import math
 import time
+import textwrap
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional, Tuple, List
@@ -139,31 +140,23 @@ def classify_risk(score: float) -> Tuple[str, str]:
     return "HIGH RISK", "#ef4444"
 
 
-def radar_card(score: float, title: str, subtitle: str, updated_dt: datetime, next_update_seconds: int):
-    label, color = classify_risk(score)
-
-    mins_ago = int((utc_now() - updated_dt).total_seconds() // 60)
-    mm = max(0, int(next_update_seconds // 60))
-    ss = max(0, int(next_update_seconds % 60))
-    countdown = f"{mm:02d}:{ss:02d}"
-
+def radar_gauge(score: float, color: str):
     val = 0.0 if score is None or (isinstance(score, float) and math.isnan(score)) else float(score)
-
     fig = go.Figure(
         go.Indicator(
             mode="gauge+number",
             value=val,
-            number={"suffix": "/100", "font": {"size": 56}},
+            number={"suffix": "/100", "font": {"size": 60}},
             gauge={
                 "axis": {"range": [0, 100], "tickwidth": 0, "ticks": ""},
-                "bar": {"color": color, "thickness": 0.35},
+                "bar": {"color": color, "thickness": 0.32},
                 "bgcolor": "rgba(0,0,0,0)",
                 "borderwidth": 0,
                 "steps": [
-                    {"range": [0, 25], "color": "rgba(34,197,94,0.18)"},
-                    {"range": [25, 50], "color": "rgba(234,179,8,0.18)"},
-                    {"range": [50, 75], "color": "rgba(249,115,22,0.18)"},
-                    {"range": [75, 100], "color": "rgba(239,68,68,0.18)"},
+                    {"range": [0, 25], "color": "rgba(34,197,94,0.16)"},
+                    {"range": [25, 50], "color": "rgba(234,179,8,0.16)"},
+                    {"range": [50, 75], "color": "rgba(249,115,22,0.16)"},
+                    {"range": [75, 100], "color": "rgba(239,68,68,0.16)"},
                 ],
             },
             title={"text": ""},
@@ -176,51 +169,35 @@ def radar_card(score: float, title: str, subtitle: str, updated_dt: datetime, ne
         plot_bgcolor="rgba(0,0,0,0)",
         font=dict(color="white"),
     )
+    return fig
 
-    st.markdown(
-        f"""
-        <div style="
-          background: rgba(255,255,255,0.04);
-          border: 1px solid rgba(255,255,255,0.08);
-          border-radius: 18px;
-          padding: 14px 16px 8px 16px;
-        ">
-          <div style="display:flex; justify-content:space-between; align-items:center; gap:12px;">
-            <div style="font-size:13px; opacity:0.85;">
-              Updated <b>{mins_ago} min ago</b> · UTC
-            </div>
-            <div style="font-size:13px; opacity:0.85;">
-              Next update in <b>{countdown}</b>
-            </div>
-          </div>
 
-          <div style="text-align:center; margin-top:12px;">
-            <div style="font-size:13px; letter-spacing:0.10em; opacity:0.85;">
-              {title}
-            </div>
-            <div style="font-size:12px; opacity:0.65; margin-top:4px;">
-              {subtitle}
-            </div>
+def radar_card(score: float, title: str, subtitle: str, updated_dt: datetime, next_update_seconds: int):
+    label, color = classify_risk(score)
+    mins_ago = int((utc_now() - updated_dt).total_seconds() // 60)
+    mm = max(0, int(next_update_seconds // 60))
+    ss = max(0, int(next_update_seconds % 60))
+    countdown = f"{mm:02d}:{ss:02d}"
 
-            <div style="
-              display:inline-block;
-              margin-top:10px;
-              padding:6px 14px;
-              border-radius:999px;
-              background:{color};
-              color:#0b0b0b;
-              font-weight:800;
-              font-size:12px;
-            ">
-              {label}
-            </div>
-          </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    html = f"""
+<div style="background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.08); border-radius: 18px; padding: 14px 16px 8px 16px;">
+  <div style="display:flex; justify-content:space-between; align-items:center; gap:12px;">
+    <div style="font-size:13px; opacity:0.85;">Updated <b>{mins_ago} min ago</b> · UTC</div>
+    <div style="font-size:13px; opacity:0.85;">Next update in <b>{countdown}</b></div>
+  </div>
 
-    st.plotly_chart(fig, use_container_width=True)
+  <div style="text-align:center; margin-top:12px;">
+    <div style="font-size:13px; letter-spacing:0.10em; opacity:0.85;">{title}</div>
+    <div style="font-size:12px; opacity:0.65; margin-top:4px;">{subtitle}</div>
+
+    <div style="display:inline-block; margin-top:10px; padding:6px 14px; border-radius:999px; background:{color}; color:#0b0b0b; font-weight:800; font-size:12px;">
+      {label}
+    </div>
+  </div>
+</div>
+"""
+    st.markdown(textwrap.dedent(html).strip(), unsafe_allow_html=True)
+    st.plotly_chart(radar_gauge(score, color), use_container_width=True)
 
 
 def live_tick(enable: bool):
@@ -228,12 +205,11 @@ def live_tick(enable: bool):
         return
     components.html(
         """
-        <script>
-          const ms = 1000;
-          setTimeout(() => {
-            window.parent.postMessage({type: "streamlit:rerun"}, "*");
-          }, ms);
-        </script>
+<script>
+  setTimeout(() => {
+    window.parent.postMessage({type: "streamlit:rerun"}, "*");
+  }, 1000);
+</script>
         """,
         height=0,
         width=0,
@@ -599,7 +575,6 @@ if refresh:
         force_update = True
 
 due_update = remaining_to_update <= 0
-
 if st.session_state["snapshot"] is None:
     force_update = True
 
