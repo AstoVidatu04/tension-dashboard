@@ -1,531 +1,397 @@
-APP_BUILD = "2026-02-02-01"
+APP_BUILD = "2026-02-02-02"
+
 import math
 import time
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Dict
 
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-import requests
-import sqlite3
 import streamlit as st
-
 
 from gdelt_structured import (
     fetch_gdelt_articles as fetch_gdelt_articles_structured,
     dedupe_syndication,
     source_diversity_factor,
-    structured_signal_score,
 )
-from market_stress import market_amplifier
 
-
-st.set_page_config(page_title="USA–Iran Tension Dashboard", layout="wide")
+# -----------------------------
+# App setup
+# -----------------------------
+st.set_page_config(page_title="USA–Iran Tension Dashboard (GDELT-only)", layout="wide")
 
 DEFAULT_WINDOW_DAYS = 30
 DEFAULT_MAXRECORDS = 250
-DEFAULT_SHIPPING_QUERY = (
-    '("Red Sea" OR "Strait of Hormuz" OR tanker OR shipping OR container) '
-    "AND (disruption OR attack OR reroute OR risk OR insurance)"
-)
-
-OPENSKY_STATES_URL = "https://opensky-network.org/api/states/all"
-OPENSKY_TOKEN_URL = "https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token"
-
-IR_LAMIN, IR_LAMAX = 25.29, 39.65
-IR_LOMIN, IR_LOMAX = 44.77, 61.49
-
-# --- OpenSky protection settings ---
-OPENSKY_BUCKET_MINUTES = 10           # do not fetch more often than this (per cache bucket)
-OPENSKY_HTTP_TIMEOUT = 10             # seconds (keep small to avoid hanging the app)
-OPENSKY_BREAKER_MINUTES = 30          # if OpenSky errors, stop trying for this long
-OPENSKY_TOKEN_TTL_SECONDS = 6 * 3600  # cache token for 6 hours (avoid auth hammering)
 
 
+# -----------------------------
+# Utilities
+# -----------------------------
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def zscore(series: pd.Series) -> pd.Series:
-    s = series.astype(float)
-    std = float(s.std(ddof=0))
-    if std == 0.0 or np.isnan(std):
-        return pd.Series(np.zeros(len(s)), index=s.index)
-    return (s - float(s.mean())) / std
+def clamp(x: float, lo: float = 0.0, hi: float = 100.0) -> float:
+    try:
+        v = float(x)
+    except Exception:
+        v = 0.0
+    return max(lo, min(hi, v))
 
 
 def logistic_0_100(x: float) -> float:
+    # sigmoid -> 0..100
     return float(100.0 * (1.0 / (1.0 + math.exp(-x))))
 
 
 def logit_from_0_100(score_0_100: float) -> float:
     eps = 1e-6
-    p = min(max(score_0_100 / 100.0, eps), 1.0 - eps)
+    p = min(max(float(score_0_100) / 100.0, eps), 1.0 - eps)
     return math.log(p / (1.0 - p))
 
 
-def safe_is_json_response(r: requests.Response) -> bool:
-    ctype = (r.headers.get("content-type") or "").lower()
-    return "application/json" in ctype or "json" in ctype
+def zscore_safe(series: pd.Series) -> pd.Series:
+    s = pd.to_numeric(series, errors="coerce").astype(float)
+    mu = float(s.mean(skipna=True)) if len(s) else 0.0
+    std = float(s.std(ddof=0, skipna=True)) if len(s) else 0.0
+    if std == 0.0 or np.isnan(std):
+        return pd.Series(np.zeros(len(s)), index=s.index)
+    return (s - mu) / std
 
 
-def shift_detected(series: List[float], recent: int = 7, prior: int = 21, z: float = 1.2) -> bool:
-    if series is None or len(series) < (recent + prior):
-        return False
-    s = np.array(series, dtype=float)
-    r = s[-recent:]
-    p = s[-(recent + prior) : -recent]
-    if p.std() == 0:
-        return False
-    return abs(r.mean() - p.mean()) / p.std() >= z
+def risk_label_color(score: float) -> Tuple[str, str]:
+    s = clamp(score)
+    if s < 20:
+        return "LOW", "#22c55e"
+    if s < 40:
+        return "GUARDED", "#eab308"
+    if s < 60:
+        return "ELEVATED", "#f97316"
+    if s < 80:
+        return "HIGH", "#ef4444"
+    return "CRITICAL", "#7f1d1d"
 
 
-def fmt_optional(x):
-    if x is None:
-        return None
-    try:
-        if isinstance(x, float) and math.isnan(x):
-            return None
-    except Exception:
-        pass
-    return x
-
-
-def risk_meter(score: float, title: str):
-    if score is None or (isinstance(score, float) and math.isnan(score)):
-        val = 0.0
-        suffix = ""
-    else:
-        val = float(score)
-        suffix = "/100"
-
-    def bar_color(v: float) -> str:
-        if v < 25:
-            return "#22c55e"
-        if v < 50:
-            return "#eab308"
-        if v < 75:
-            return "#f97316"
-        return "#ef4444"
+def risk_meter(score: float, title: str) -> go.Figure:
+    val = 0.0 if score is None or (isinstance(score, float) and math.isnan(score)) else float(score)
+    label, color = risk_label_color(val)
 
     fig = go.Figure(
         go.Indicator(
             mode="gauge+number",
             value=val,
-            number={"suffix": suffix, "font": {"size": 42}},
+            number={"suffix": "/100", "font": {"size": 42}},
             title={"text": title, "font": {"size": 16}},
             gauge={
                 "axis": {"range": [0, 100]},
-                "bar": {"color": bar_color(val)},
+                "bar": {"color": color},
                 "steps": [
-                    {"range": [0, 25], "color": "rgba(34,197,94,0.25)"},
-                    {"range": [25, 50], "color": "rgba(234,179,8,0.25)"},
-                    {"range": [50, 75], "color": "rgba(249,115,22,0.25)"},
-                    {"range": [75, 100], "color": "rgba(239,68,68,0.25)"},
+                    {"range": [0, 20], "color": "rgba(34,197,94,0.20)"},
+                    {"range": [20, 40], "color": "rgba(234,179,8,0.18)"},
+                    {"range": [40, 60], "color": "rgba(249,115,22,0.16)"},
+                    {"range": [60, 80], "color": "rgba(239,68,68,0.16)"},
+                    {"range": [80, 100], "color": "rgba(127,29,29,0.18)"},
                 ],
             },
         )
     )
-    fig.update_layout(height=230, margin=dict(l=10, r=10, t=45, b=10))
+    fig.update_layout(height=230, margin=dict(l=10, r=10, t=45, b=10), paper_bgcolor="rgba(0,0,0,0)")
     return fig
 
 
+def extract_tone_series(df: pd.DataFrame) -> pd.Series:
+    """
+    Robust extraction of tone from likely columns.
+    Falls back to parsing the first float in a string (some feeds store tone like "-2.3,0.1,...").
+    Returns float Series with NaN where unavailable.
+    """
+    candidates = ["tone", "avgTone", "avgtone", "tone_score", "toneScore", "Tone"]
+    for c in candidates:
+        if c in df.columns:
+            s = pd.to_numeric(df[c], errors="coerce")
+            if int(s.notna().sum()) > 0:
+                return s.astype(float)
+
+    # Parse from string-like tone
+    if "tone" in df.columns:
+        s = df["tone"].astype(str).str.extract(r"(-?\d+(\.\d+)?)")[0]
+        s = pd.to_numeric(s, errors="coerce")
+        return s.astype(float)
+
+    return pd.Series([np.nan] * len(df), index=df.index, dtype=float)
+
+
+def normalize_text(s: str) -> str:
+    if not isinstance(s, str):
+        return ""
+    return " ".join(s.lower().strip().split())
+
+
+def count_keywords_in_text(text: str, keywords: List[str]) -> int:
+    """
+    Simple substring matching. For your use case this is fine and fast.
+    """
+    t = normalize_text(text)
+    if not t:
+        return 0
+    hits = 0
+    for k in keywords:
+        kk = k.lower()
+        if kk and kk in t:
+            hits += 1
+    return hits
+
+
+def themes_contains_any(themes, needles: List[str]) -> bool:
+    """
+    themes may be list[str] (your code uses themes_list sometimes).
+    """
+    if not isinstance(themes, list):
+        return False
+    for t in themes:
+        if not isinstance(t, str):
+            continue
+        u = t.upper()
+        for n in needles:
+            if n in u:
+                return True
+    return False
+
+
+# -----------------------------
+# Keyword sets (GDELT-only intent model)
+# -----------------------------
+ESCALATION_KW = [
+    "airstrike", "strike", "missile", "rocket", "drone", "ballistic",
+    "retaliat", "revenge", "attack", "assault", "intercept", "downed",
+    "irgc", "revolutionary guard", "sanction", "embargo",
+    "detain", "arrest", "seiz", "confiscat",
+    "naval", "warship", "destroyer", "carrier", "submarine",
+    "proxy", "militia", "hezbollah", "houthis",
+    "explosion", "blast", "killed", "casualt",
+    "nuclear", "uranium", "enrichment",
+    "strait of hormuz", "persian gulf",
+]
+
+DEESCALATION_KW = [
+    "talk", "talks", "negotiat", "mediat", "diplomac", "peace", "ceasefire",
+    "agreement", "deal", "backchannel", "dialogue", "de-escalat", "deescalat",
+    "confidence-building", "summit",
+]
+
+CONFLICT_THEME_NEEDLES = [
+    "ARMEDCONFLICT", "TERRORISM", "MILITARY", "VIOLENCE", "SECURITYSERVICES",
+    "WEAPONS", "AIRSTRIKES", "MISSILES", "DRONE", "NAVY", "SANCTIONS",
+]
+
+DIPLO_THEME_NEEDLES = [
+    "NEGOTIATIONS", "MEDIATION", "DIPLOMACY", "PEACE", "CEASEFIRE", "TREATY",
+]
+
+
+# -----------------------------
+# Data fetch (cached)
+# -----------------------------
 @st.cache_data(ttl=60 * 60, show_spinner=False)
 def cached_fetch_structured(query: str, hours_back: int, max_records: int, cache_key: str) -> pd.DataFrame:
     _ = cache_key
     return fetch_gdelt_articles_structured(query=query, hours_back=hours_back, max_records=max_records)
 
 
-def build_daily_structured_features(df_articles: pd.DataFrame) -> pd.DataFrame:
+# -----------------------------
+# Feature engineering (daily)
+# -----------------------------
+def build_daily_features(df_articles: pd.DataFrame) -> pd.DataFrame:
+    """
+    Produces daily features:
+      - articles
+      - neg_tone_mean
+      - diplomacy_share (theme-based)
+      - conflict_share (theme-based)
+      - escalation_hits_per_article
+      - deesc_hits_per_article
+      - intent_net (escalation - deesc per article)
+    """
     if df_articles is None or df_articles.empty:
-        return pd.DataFrame(columns=["date", "articles", "tension_core", "diplomacy_share"])
+        return pd.DataFrame(columns=[
+            "date", "articles", "neg_tone_mean",
+            "diplomacy_share", "conflict_share",
+            "escal_hits", "deesc_hits", "intent_net"
+        ])
 
     df = df_articles.copy()
 
+    # datetime
     if "seendate" in df.columns:
-        df["datetime"] = pd.to_datetime(df["seendate"], errors="coerce", utc=True)
+        df["dt"] = pd.to_datetime(df["seendate"], errors="coerce", utc=True)
     elif "datetime" in df.columns:
-        df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce", utc=True)
+        df["dt"] = pd.to_datetime(df["datetime"], errors="coerce", utc=True)
     else:
-        df["datetime"] = pd.NaT
+        df["dt"] = pd.NaT
 
-    df = df.dropna(subset=["datetime"]).copy()
+    df = df.dropna(subset=["dt"]).copy()
     if df.empty:
-        return pd.DataFrame(columns=["date", "articles", "tension_core", "diplomacy_share"])
+        return pd.DataFrame(columns=[
+            "date", "articles", "neg_tone_mean",
+            "diplomacy_share", "conflict_share",
+            "escal_hits", "deesc_hits", "intent_net"
+        ])
 
-    df["date"] = df["datetime"].dt.date
-    df["tone_num"] = pd.to_numeric(df.get("tone", pd.Series([np.nan] * len(df))), errors="coerce").clip(-10, 10)
+    df["date"] = df["dt"].dt.date
 
-    dip_keywords = {"NEGOTIATIONS", "MEDIATION", "DIPLOMACY", "PEACE", "CEASEFIRE", "TREATY"}
+    # tone
+    tone = extract_tone_series(df).clip(-10, 10)
+    df["tone_num"] = tone
 
-    def is_diplomatic(themes):
-        if not isinstance(themes, list):
-            return False
-        for t in themes:
-            if not isinstance(t, str):
-                continue
-            u = t.upper()
-            for k in dip_keywords:
-                if k in u:
-                    return True
-        return False
+    # negativity magnitude (0 for non-negative tone)
+    # If tone missing, NaN stays NaN; handled in aggregation.
+    df["neg_mag"] = df["tone_num"].apply(lambda x: float(-x) if pd.notna(x) and x < 0 else (0.0 if pd.notna(x) else np.nan))
 
-    if "themes_list" in df.columns:
-        df["is_diplomatic"] = df["themes_list"].apply(is_diplomatic).astype(int)
+    # text for intent keywords (title + optional extras)
+    title = df["title"] if "title" in df.columns else pd.Series([""] * len(df), index=df.index)
+    extras = []
+    for col in ["description", "snippet", "summary"]:
+        if col in df.columns:
+            extras.append(df[col].astype(str))
+    if extras:
+        text = title.astype(str) + " " + extras[0]
+        for e in extras[1:]:
+            text = text + " " + e
     else:
-        df["is_diplomatic"] = 0
+        text = title.astype(str)
 
-    def tension_core_for_group(g: pd.DataFrame) -> float:
-        t = g["tone_num"].dropna()
-        if t.empty:
-            return 0.0
-        return float((-t[t < 0]).sum() / max(len(g), 1))
+    df["escal_hits_raw"] = text.apply(lambda t: count_keywords_in_text(t, ESCALATION_KW))
+    df["deesc_hits_raw"] = text.apply(lambda t: count_keywords_in_text(t, DEESCALATION_KW))
+
+    # theme-based shares (if themes_list exists; otherwise 0)
+    if "themes_list" in df.columns:
+        df["is_diplomacy"] = df["themes_list"].apply(lambda x: 1 if themes_contains_any(x, DIPLO_THEME_NEEDLES) else 0)
+        df["is_conflict"] = df["themes_list"].apply(lambda x: 1 if themes_contains_any(x, CONFLICT_THEME_NEEDLES) else 0)
+    else:
+        df["is_diplomacy"] = 0
+        df["is_conflict"] = 0
 
     daily = (
         df.groupby("date", as_index=False)
         .agg(
-            articles=("url", "count"),
-            diplomacy_share=("is_diplomatic", "mean"),
+            articles=("url", "count") if "url" in df.columns else ("date", "count"),
+            neg_tone_mean=("neg_mag", "mean"),
+            diplomacy_share=("is_diplomacy", "mean"),
+            conflict_share=("is_conflict", "mean"),
+            escal_hits=("escal_hits_raw", "sum"),
+            deesc_hits=("deesc_hits_raw", "sum"),
         )
         .sort_values("date")
     )
 
-    cores = df.groupby("date").apply(tension_core_for_group).reset_index(name="tension_core")
-    daily = daily.merge(cores, on="date", how="left")
+    # Fill tone mean if missing (if tone not available, we want it to contribute 0, but NOT silently)
+    daily["neg_tone_mean"] = daily["neg_tone_mean"].fillna(0.0).astype(float)
 
+    # per-article rates
+    daily["escal_hits"] = daily["escal_hits"].fillna(0).astype(int)
+    daily["deesc_hits"] = daily["deesc_hits"].fillna(0).astype(int)
+    daily["intent_net"] = ((daily["escal_hits"] - daily["deesc_hits"]) / daily["articles"].clip(lower=1)).astype(float)
+
+    # reindex to full day range so rolling/z-score works consistently
     all_days = pd.date_range(daily["date"].min(), daily["date"].max(), freq="D").date
     daily = daily.set_index("date").reindex(all_days).rename_axis("date").reset_index()
 
     daily["articles"] = daily["articles"].fillna(0).astype(int)
+    daily["neg_tone_mean"] = daily["neg_tone_mean"].fillna(0.0).astype(float)
     daily["diplomacy_share"] = daily["diplomacy_share"].fillna(0.0).astype(float)
-    daily["tension_core"] = daily["tension_core"].fillna(0.0).astype(float)
+    daily["conflict_share"] = daily["conflict_share"].fillna(0.0).astype(float)
+    daily["escal_hits"] = daily["escal_hits"].fillna(0).astype(int)
+    daily["deesc_hits"] = daily["deesc_hits"].fillna(0).astype(int)
+    daily["intent_net"] = daily["intent_net"].fillna(0.0).astype(float)
+
     return daily
 
 
-def compute_structured_score_series(daily: pd.DataFrame, smooth_days: int, diplomacy_weight: float) -> pd.DataFrame:
+def compute_score_series(
+    daily: pd.DataFrame,
+    smooth_days: int,
+    w_tone: float,
+    w_intent: float,
+    w_conflict: float,
+    w_volume: float,
+    w_diplomacy: float,
+) -> pd.DataFrame:
+    """
+    Combine multiple daily signals into one raw score then map to 0..100.
+
+    Signals:
+      - tone negativity (smoothed, z-scored)
+      - intent_net (smoothed, z-scored)
+      - conflict_share (smoothed, z-scored)
+      - volume (articles, z-scored)
+      - diplomacy_share (smoothed, z-scored) subtractive
+    """
     if daily is None or daily.empty:
-        return pd.DataFrame(columns=list(daily.columns) + ["score"])
+        return pd.DataFrame(columns=list(daily.columns) + ["raw", "score"])
 
     d = daily.copy()
-    d["tension_sm"] = d["tension_core"].rolling(window=smooth_days, min_periods=1).mean()
-    d["z_tension"] = zscore(d["tension_sm"])
-    raw = d["z_tension"] - (diplomacy_weight * d["diplomacy_share"])
-    d["score"] = (100.0 * (1.0 / (1.0 + np.exp(-raw)))).astype(float)
+
+    # Smooth
+    d["tone_sm"] = d["neg_tone_mean"].rolling(window=smooth_days, min_periods=1).mean()
+    d["intent_sm"] = d["intent_net"].rolling(window=smooth_days, min_periods=1).mean()
+    d["conflict_sm"] = d["conflict_share"].rolling(window=smooth_days, min_periods=1).mean()
+    d["diplomacy_sm"] = d["diplomacy_share"].rolling(window=smooth_days, min_periods=1).mean()
+
+    # Normalize
+    d["z_tone"] = zscore_safe(d["tone_sm"])
+    d["z_intent"] = zscore_safe(d["intent_sm"])
+    d["z_conflict"] = zscore_safe(d["conflict_sm"])
+    d["z_volume"] = zscore_safe(d["articles"].astype(float))
+    d["z_diplomacy"] = zscore_safe(d["diplomacy_sm"])
+
+    # Raw equation (simple + explainable)
+    d["raw"] = (
+        (w_tone * d["z_tone"]) +
+        (w_intent * d["z_intent"]) +
+        (w_conflict * d["z_conflict"]) +
+        (w_volume * d["z_volume"]) -
+        (w_diplomacy * d["z_diplomacy"])
+    ).astype(float)
+
+    d["score"] = d["raw"].apply(lambda x: logistic_0_100(float(x)))
     return d
 
 
-DB_PATH = Path(__file__).with_name("flights.db")
-
-
-def db_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH.as_posix(), check_same_thread=False)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA synchronous=NORMAL;")
-    return conn
-
-
-def init_flights_db() -> None:
-    conn = db_conn()
-    try:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS flight_samples (
-                ts_utc TEXT PRIMARY KEY,
-                airborne INTEGER NOT NULL
-            )
-            """
-        )
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_flight_samples_ts ON flight_samples(ts_utc)")
-        conn.commit()
-    finally:
-        conn.close()
-
-
-def insert_flight_sample(ts: datetime, airborne: int) -> None:
-    ts_utc = ts.astimezone(timezone.utc).replace(microsecond=0).isoformat()
-    conn = db_conn()
-    try:
-        conn.execute(
-            "INSERT OR IGNORE INTO flight_samples(ts_utc, airborne) VALUES (?, ?)",
-            (ts_utc, int(airborne)),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-
-def read_flight_samples(hours_back: int = 24, limit: int = 5000) -> pd.DataFrame:
-    cutoff = (utc_now() - timedelta(hours=hours_back)).replace(microsecond=0).isoformat()
-    conn = db_conn()
-    try:
-        rows = conn.execute(
-            """
-            SELECT ts_utc, airborne
-            FROM flight_samples
-            WHERE ts_utc >= ?
-            ORDER BY ts_utc ASC
-            LIMIT ?
-            """,
-            (cutoff, int(limit)),
-        ).fetchall()
-    finally:
-        conn.close()
-
-    df = pd.DataFrame(rows, columns=["ts", "airborne"])
-    if df.empty:
-        return df
-    df["ts"] = pd.to_datetime(df["ts"], utc=True, errors="coerce")
-    df = df.dropna(subset=["ts"])
-    df["airborne"] = pd.to_numeric(df["airborne"], errors="coerce").fillna(0).astype(int)
-    return df
-
-
-def prune_flights_db(keep_days: int = 120) -> int:
-    cutoff = (utc_now() - timedelta(days=keep_days)).replace(microsecond=0).isoformat()
-    conn = db_conn()
-    try:
-        cur = conn.execute("DELETE FROM flight_samples WHERE ts_utc < ?", (cutoff,))
-        conn.commit()
-        return int(cur.rowcount)
-    finally:
-        conn.close()
-
-
-def compute_flight_z_baselined(
-    now_ts: datetime,
-    baseline_days: int = 28,
-    min_baseline_points: int = 30,
-    lookback_hours_for_plot: int = 24,
-) -> Tuple[Optional[float], pd.DataFrame]:
-    hours_back = baseline_days * 24
-    df = read_flight_samples(hours_back=hours_back)
-
-    if df.empty or len(df) < 10:
-        return None, read_flight_samples(hours_back=lookback_hours_for_plot)
-
-    latest = df.iloc[-1]
-    latest_ts = latest["ts"]
-    latest_val = float(latest["airborne"])
-
-    dow = int(latest_ts.dayofweek)
-    hour = int(latest_ts.hour)
-
-    df["dow"] = df["ts"].dt.dayofweek
-    df["hour"] = df["ts"].dt.hour
-
-    hist = df.iloc[:-1]
-    base = hist[(hist["dow"] == dow) & (hist["hour"] == hour)].copy()
-
-    if len(base) < min_baseline_points:
-        df24 = read_flight_samples(hours_back=lookback_hours_for_plot)
-        if len(df24) < 6:
-            return None, df24
-        z = float(zscore(df24["airborne"]).iloc[-1])
-        return z, df24
-
-    mu = float(base["airborne"].mean())
-    sigma = float(base["airborne"].std(ddof=0))
-    if sigma == 0.0 or np.isnan(sigma):
-        return None, read_flight_samples(hours_back=lookback_hours_for_plot)
-
-    z = (latest_val - mu) / sigma
-    df24 = df[df["ts"] >= (now_ts - timedelta(hours=lookback_hours_for_plot))][["ts", "airborne"]].copy()
-    return float(z), df24
-
-
-def get_secret(key: str) -> str:
-    if key in st.secrets:
-        return str(st.secrets[key])
-    import os
-    v = os.environ.get(key)
-    if v:
-        return v
-    raise RuntimeError(f"Missing secret: {key}")
-
-
 # -----------------------------
-# OpenSky: Circuit breaker + safer fetch
+# UI
 # -----------------------------
-def opensky_is_in_backoff() -> bool:
-    until = float(st.session_state.get("opensky_backoff_until", 0.0))
-    return time.time() < until
-
-
-def opensky_trip_breaker(reason: str) -> str:
-    backoff_until = time.time() + OPENSKY_BREAKER_MINUTES * 60
-    st.session_state["opensky_backoff_until"] = backoff_until
-    st.session_state["opensky_fail_count"] = int(st.session_state.get("opensky_fail_count", 0)) + 1
-    return f"OpenSky temporarily disabled for {OPENSKY_BREAKER_MINUTES} min (reason: {reason})"
-
-
-@st.cache_data(ttl=OPENSKY_TOKEN_TTL_SECONDS, show_spinner=False)
-def fetch_opensky_token_cached(cache_key: str) -> Tuple[Optional[str], str]:
-    _ = cache_key
-    try:
-        client_id = get_secret("OPENSKY_CLIENT_ID")
-        client_secret = get_secret("OPENSKY_CLIENT_SECRET")
-    except Exception as e:
-        return None, f"OpenSky credentials missing: {e}"
-
-    try:
-        r = requests.post(
-            OPENSKY_TOKEN_URL,
-            data={
-                "grant_type": "client_credentials",
-                "client_id": client_id,
-                "client_secret": client_secret,
-            },
-            timeout=OPENSKY_HTTP_TIMEOUT,
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-        )
-    except requests.RequestException as e:
-        return None, f"OpenSky token request error: {e}"
-
-    if r.status_code != 200:
-        snippet = (r.text or "")[:220].replace("\n", " ").strip()
-        return None, f"OpenSky token HTTP {r.status_code}. Snippet: {snippet}"
-
-    if not safe_is_json_response(r):
-        return None, "OpenSky token endpoint returned non-JSON."
-
-    js = r.json()
-    token = js.get("access_token")
-    if not token:
-        return None, "OpenSky token response missing access_token."
-    return token, "OK"
-
-
-@st.cache_data(ttl=OPENSKY_BUCKET_MINUTES * 60, show_spinner=False)
-def fetch_opensky_states_bbox_safe(
-    cache_key: str,
-    lamin: float,
-    lamax: float,
-    lomin: float,
-    lomax: float,
-) -> Tuple[Optional[int], str]:
-    """
-    Returns:
-      (airborne_count, message)
-    airborne_count is None on failure (so we don't insert bogus 0 into DB).
-    """
-    _ = cache_key
-
-    # If breaker is tripped, skip completely
-    if opensky_is_in_backoff():
-        until = float(st.session_state.get("opensky_backoff_until", 0.0))
-        mins = int(max(0, (until - time.time()) // 60))
-        return None, f"OpenSky backoff active ({mins} min remaining)."
-
-    params = {"lamin": lamin, "lamax": lamax, "lomin": lomin, "lomax": lomax}
-
-    # Try token (but don't *require* it)
-    token, tok_msg = fetch_opensky_token_cached("token-" + cache_key)
-    headers = {"User-Agent": "tension-dashboard/1.0"}
-
-    # 1) Attempt authenticated if token exists
-    if token:
-        try:
-            r = requests.get(
-                OPENSKY_STATES_URL,
-                params=params,
-                timeout=OPENSKY_HTTP_TIMEOUT,
-                headers={**headers, "Authorization": f"Bearer {token}"},
-            )
-            if r.status_code == 200 and safe_is_json_response(r):
-                js = r.json()
-                states = js.get("states") or []
-                airborne = 0
-                for s in states:
-                    if isinstance(s, list) and len(s) > 8:
-                        if s[8] is False:
-                            airborne += 1
-                return airborne, "OK (auth)"
-        except requests.RequestException as e:
-            # fall through to unauth attempt; don't trip breaker yet
-            auth_err = str(e)
-        else:
-            auth_err = "auth request failed"
-
-    # 2) Attempt unauthenticated (often works even when auth endpoint is blocked)
-    try:
-        r = requests.get(
-            OPENSKY_STATES_URL,
-            params=params,
-            timeout=OPENSKY_HTTP_TIMEOUT,
-            headers=headers,
-        )
-    except requests.RequestException as e:
-        # Trip breaker on hard connectivity problems
-        reason = str(e)
-        return None, opensky_trip_breaker(reason)
-
-    if r.status_code != 200:
-        snippet = (r.text or "")[:220].replace("\n", " ").strip()
-        # Trip breaker on repeated non-200 as well (common when blackholed/throttled)
-        return None, opensky_trip_breaker(f"HTTP {r.status_code} {snippet}")
-
-    if not safe_is_json_response(r):
-        return None, opensky_trip_breaker("non-JSON response")
-
-    js = r.json()
-    states = js.get("states") or []
-    airborne = 0
-    for s in states:
-        if isinstance(s, list) and len(s) > 8:
-            if s[8] is False:
-                airborne += 1
-
-    # Don't trip breaker if we got a valid response, even if states=0
-    # (0 can be legit depending on bbox/time)
-    return airborne, "OK (unauth)"
-
-
-# -----------------------------
-# App UI
-# -----------------------------
-init_flights_db()
-
 st.title("USA–Iran Tension Dashboard")
-st.caption("Structured news-derived indicator (GDELT) + aggregate air-traffic signal over Iran (OpenSky).")
+st.caption("GDELT-only: multi-signal indicator using tone, intent keywords, conflict themes, diplomacy themes, and volume anomalies.")
 
-tab1, tab2 = st.tabs(["Tension dashboard", "Air traffic signal"])
+tab1, tab2 = st.tabs(["Tension dashboard", "Model & debug"])
 
 with st.sidebar:
     st.header("GDELT")
-    default_query = "(United States OR USA OR US) (Iran OR Iranian)"
+    default_query = '(United States OR USA OR US OR Pentagon OR CENTCOM) (Iran OR Iranian OR Tehran OR IRGC OR "Strait of Hormuz" OR "Persian Gulf")'
     query = st.text_input("GDELT query", value=default_query)
     window_days = st.slider("Lookback (days)", 7, 180, DEFAULT_WINDOW_DAYS)
-    maxrecords = st.slider("Max articles to fetch", 50, 250, DEFAULT_MAXRECORDS, step=25)
+    maxrecords = st.slider("Max articles to fetch", 50, 500, DEFAULT_MAXRECORDS, step=25)
 
-    st.header("Structured scoring")
+    st.header("Scoring")
     smooth_days = st.slider("Smoothing (days)", 1, 14, 3)
-    diplomacy_weight = st.slider("Diplomacy dampening", 0.0, 2.0, 0.5, 0.1)
 
-    st.header("Amplifiers (latest score only)")
-    enable_market_amp = st.checkbox("Enable market stress amplifier (oil/VIX)", value=True)
-    enable_shipping_amp = st.checkbox("Enable shipping disruption news amplifier", value=False)
-    shipping_query = st.text_input("Shipping query (GDELT)", value=DEFAULT_SHIPPING_QUERY)
-
-    st.header("Air traffic signal")
-    enable_air_signal = st.checkbox("Enable Iran air-traffic signal", value=True)
-    w_air_traffic = st.slider("Air traffic impact (↑ when traffic drops)", 0.0, 3.0, 1.0, 0.1)
+    st.subheader("Weights")
+    w_tone = st.slider("Tone negativity weight", 0.0, 2.0, 0.9, 0.05)
+    w_intent = st.slider("Intent keywords weight", 0.0, 2.0, 1.0, 0.05)
+    w_conflict = st.slider("Conflict themes weight", 0.0, 2.0, 0.8, 0.05)
+    w_volume = st.slider("Volume spike weight", 0.0, 2.0, 0.5, 0.05)
+    w_diplomacy = st.slider("Diplomacy dampening", 0.0, 2.0, 0.6, 0.05)
 
     st.header("Controls")
     refresh = st.button("Refresh now")
 
-    st.subheader("Flight DB maintenance")
-    keep_days = st.number_input("Keep flight samples (days)", min_value=14, max_value=365, value=120, step=7)
-    if st.button("Prune flight DB"):
-        deleted = prune_flights_db(keep_days=int(keep_days))
-        st.success(f"Deleted {deleted} old flight samples (kept last {int(keep_days)} days).")
-
+# manual refresh cooldown (prevents accidental hammering of GDELT)
 if "last_refresh_ts" not in st.session_state:
     st.session_state["last_refresh_ts"] = 0.0
 
-cooldown_seconds = 30
+cooldown_seconds = 20
 cache_key = "stable"
 if refresh:
     now_ts = time.time()
@@ -535,248 +401,102 @@ if refresh:
         st.session_state["last_refresh_ts"] = now_ts
         cache_key = utc_now().strftime("%Y%m%d%H%M%S")
 
-end_dt = utc_now()
 hours_back = int(window_days) * 24
+end_dt = utc_now()
 
 with st.spinner("Fetching GDELT articles…"):
     articles = cached_fetch_structured(query=query, hours_back=hours_back, max_records=maxrecords, cache_key=cache_key)
 
 articles = dedupe_syndication(articles) if articles is not None else pd.DataFrame()
 
-div_mult = source_diversity_factor(articles) if not articles.empty else 0.8
-sig = (
-    structured_signal_score(articles)
-    if not articles.empty
-    else {"tension_core": 0.0, "diplomacy_share": 0.0, "uncertainty": 1.0}
-)
+# source diversity multiplier (kept from your original design)
+div_mult = source_diversity_factor(articles) if not articles.empty else 0.9
 
-daily = build_daily_structured_features(articles)
-scored = compute_structured_score_series(daily, smooth_days=smooth_days, diplomacy_weight=diplomacy_weight)
+daily = build_daily_features(articles)
+scored = compute_score_series(
+    daily=daily,
+    smooth_days=smooth_days,
+    w_tone=w_tone,
+    w_intent=w_intent,
+    w_conflict=w_conflict,
+    w_volume=w_volume,
+    w_diplomacy=w_diplomacy,
+)
 
 base_latest_score = float(scored["score"].iloc[-1]) if len(scored) else float("nan")
 
-if not math.isnan(base_latest_score):
-    raw = logit_from_0_100(base_latest_score)
-    raw *= float(div_mult)
-    base_latest_score = logistic_0_100(raw)
+# Apply diversity multiplier on logit (same concept as your older version)
+adjusted_score = base_latest_score
+if not math.isnan(adjusted_score):
+    raw_logit = logit_from_0_100(adjusted_score)
+    raw_logit *= float(div_mult)
+    adjusted_score = logistic_0_100(raw_logit)
+    adjusted_score = clamp(adjusted_score)
 
-band = int(round(8 * float(sig.get("uncertainty", 1.0))))
-low_band = None
-high_band = None
-if not math.isnan(base_latest_score):
-    low_band = max(0, int(round(base_latest_score - band)))
-    high_band = min(100, int(round(base_latest_score + band)))
+# quick “uncertainty band” based on recent raw volatility
+low_band = high_band = None
+if len(scored) >= 10 and not math.isnan(adjusted_score):
+    recent = scored["score"].tail(14).astype(float)
+    band = int(round(max(3.0, float(recent.std(ddof=0)))))  # simple band
+    low_band = max(0, int(round(adjusted_score - band)))
+    high_band = min(100, int(round(adjusted_score + band)))
 
-shift_flag = False
-if not scored.empty:
-    shift_flag = shift_detected(scored["score"].astype(float).tolist())
-
-shipping_mult = 1.0
-shipping_articles_count = 0
-if enable_shipping_amp:
-    with st.spinner("Fetching shipping disruption volume…"):
-        ship_df = cached_fetch_structured(
-            query=shipping_query, hours_back=72, max_records=250, cache_key="ship-" + cache_key
-        )
-    ship_df = dedupe_syndication(ship_df) if ship_df is not None else pd.DataFrame()
-    shipping_articles_count = int(len(ship_df))
-    if shipping_articles_count >= 40:
-        shipping_mult = 1.05
-    if shipping_articles_count >= 80:
-        shipping_mult = 1.10
-
-mkt_mult = float(market_amplifier()) if enable_market_amp else 1.0
-
-airborne_over_iran = None
-air_msg = "Air traffic signal disabled."
-flight_z = None
-df24 = pd.DataFrame(columns=["ts", "airborne"])
-
-adjusted_latest_score = base_latest_score
-
-# ---- OpenSky fetch (safe) ----
-if enable_air_signal:
-    bucket = end_dt.replace(
-        minute=(end_dt.minute // OPENSKY_BUCKET_MINUTES) * OPENSKY_BUCKET_MINUTES,
-        second=0,
-        microsecond=0,
-    )
-    os_cache_key = bucket.strftime("%Y%m%d%H%M")
-
-    with st.spinner("Fetching OpenSky air-traffic snapshot over Iran…"):
-        count, air_msg = fetch_opensky_states_bbox_safe(
-            cache_key=os_cache_key,
-            lamin=IR_LAMIN,
-            lamax=IR_LAMAX,
-            lomin=IR_LOMIN,
-            lomax=IR_LOMAX,
-        )
-
-    # Only store/update baseline if we got a real measurement
-    if count is not None:
-        airborne_over_iran = int(count)
-        insert_flight_sample(end_dt, airborne_over_iran)
-        flight_z, df24 = compute_flight_z_baselined(
-            now_ts=end_dt,
-            baseline_days=28,
-            min_baseline_points=30,
-            lookback_hours_for_plot=24,
-        )
-
-        if flight_z is not None and not math.isnan(adjusted_latest_score):
-            raw = logit_from_0_100(adjusted_latest_score)
-            raw_adj = raw + (-w_air_traffic * float(flight_z))
-            adjusted_latest_score = logistic_0_100(raw_adj)
-    else:
-        # On failure, show recent history plot if we have it
-        df24 = read_flight_samples(hours_back=24)
-
-if not math.isnan(adjusted_latest_score):
-    adjusted_latest_score = float(adjusted_latest_score) * float(mkt_mult) * float(shipping_mult)
-    adjusted_latest_score = float(max(0.0, min(100.0, adjusted_latest_score)))
 
 # -----------------------------
-# Tabs
+# Tab 1: Dashboard
 # -----------------------------
 with tab1:
-    st.info(
-        "GDELT is cached (1 hour). OpenSky snapshot is bucketed (~10 minutes) and protected by backoff. "
-        "Market/shipping amplifiers adjust the latest score only."
-    )
-
-    if shift_flag:
-        st.warning("Regime shift detected: the last week differs materially from the prior baseline.")
+    st.info("GDELT cached (~1 hour). Score uses: tone negativity + intent keywords + conflict themes + volume spikes − diplomacy themes. Source diversity adjusts confidence.")
 
     c1, c2, c3, c4, c5 = st.columns([1.25, 1.25, 1, 1, 1])
-    c1.plotly_chart(risk_meter(base_latest_score, title="Base risk score (latest)"), use_container_width=True)
-    c2.plotly_chart(risk_meter(adjusted_latest_score, title="Adjusted score (latest)"), use_container_width=True)
+    c1.plotly_chart(risk_meter(base_latest_score, "Base risk score (latest)"), use_container_width=True)
+    c2.plotly_chart(risk_meter(adjusted_score, "Adjusted score (latest)"), use_container_width=True)
     c3.metric("Articles (deduped)", f"{len(articles)}")
     c4.metric("Window", f"{window_days} days")
     c5.metric("Updated (UTC)", end_dt.strftime("%Y-%m-%d %H:%M"))
 
-    b1, b2, b3, b4 = st.columns(4)
+    b1, b2, b3 = st.columns(3)
     b1.metric("Uncertainty band", "—" if low_band is None else f"{low_band}–{high_band}")
     b2.metric("Source diversity multiplier", f"{div_mult:.2f}")
-    b3.metric("Market amplifier", f"{mkt_mult:.2f}" if enable_market_amp else "off")
-    b4.metric("Shipping amp", f"{shipping_mult:.2f} ({shipping_articles_count} arts)" if enable_shipping_amp else "off")
-
-    st.caption(f"OpenSky: {air_msg}")
-
-    a1, a2, a3 = st.columns(3)
-    a1.metric("Airborne over Iran (snapshot)", "—" if airborne_over_iran is None else str(airborne_over_iran))
-    a2.metric("Air-traffic z-score (baselined)", "—" if flight_z is None else f"{flight_z:+.2f}")
-    a3.metric("Air traffic weight", f"{w_air_traffic:.1f}")
+    lbl, col = risk_label_color(adjusted_score if not math.isnan(adjusted_score) else 0.0)
+    b3.metric("Risk label", lbl)
 
     st.divider()
 
-    left, right = st.columns([1.25, 1])
+    left, right = st.columns([1.35, 1])
 
     with left:
-        st.subheader("Risk score over time (structured)")
+        st.subheader("Risk score over time")
         if scored.empty:
-            st.info("No usable articles in this window. Try a longer window or loosen the query.")
+            st.warning("No usable data. Try a longer window or loosen the query.")
         else:
             fig = px.line(scored, x="date", y="score")
             st.plotly_chart(fig, use_container_width=True)
 
-        st.subheader("Structured drivers (daily)")
+        st.subheader("Daily signals (normalized inputs)")
         if not scored.empty:
-            melted = scored.melt(
-                id_vars=["date"],
-                value_vars=["tension_core", "diplomacy_share", "articles"],
-                var_name="signal",
-                value_name="value",
-            )
-            fig2 = px.line(melted, x="date", y="value", color="signal")
+            plot_cols = ["z_tone", "z_intent", "z_conflict", "z_volume", "z_diplomacy"]
+            melted = scored.melt(id_vars=["date"], value_vars=plot_cols, var_name="signal", value_name="z")
+            fig2 = px.line(melted, x="date", y="z", color="signal")
             st.plotly_chart(fig2, use_container_width=True)
 
     with right:
-        st.subheader("Latest-day drivers (structured)")
-        st.caption("Hover column headers for definitions.")
+        st.subheader("Latest-day drivers")
         if scored.empty:
             st.write("—")
         else:
             last = scored.iloc[-1]
             drivers = pd.DataFrame(
                 [
-                    {
-                        "component": "tension_core (tone)",
-                        "value": float(last["tension_core"]),
-                        "z": float(last["z_tension"]),
-                        "weight": 1.0,
-                        "effect": float(last["z_tension"]) * 1.0,
-                    },
-                    {
-                        "component": "diplomacy_share",
-                        "value": float(last["diplomacy_share"]),
-                        "z": None,
-                        "weight": float(diplomacy_weight),
-                        "effect": -float(diplomacy_weight) * float(last["diplomacy_share"]),
-                    },
-                    {"component": "articles", "value": int(last["articles"]), "z": None, "weight": None, "effect": None},
+                    {"component": "Tone negativity (z)", "value": float(last["tone_sm"]), "z": float(last["z_tone"]), "weight": float(w_tone), "effect": float(w_tone) * float(last["z_tone"])},
+                    {"component": "Intent net (z)", "value": float(last["intent_sm"]), "z": float(last["z_intent"]), "weight": float(w_intent), "effect": float(w_intent) * float(last["z_intent"])},
+                    {"component": "Conflict themes (z)", "value": float(last["conflict_sm"]), "z": float(last["z_conflict"]), "weight": float(w_conflict), "effect": float(w_conflict) * float(last["z_conflict"])},
+                    {"component": "Volume spike (z)", "value": int(last["articles"]), "z": float(last["z_volume"]), "weight": float(w_volume), "effect": float(w_volume) * float(last["z_volume"])},
+                    {"component": "Diplomacy (z) [damp]", "value": float(last["diplomacy_sm"]), "z": float(last["z_diplomacy"]), "weight": float(w_diplomacy), "effect": -float(w_diplomacy) * float(last["z_diplomacy"])},
+                    {"component": "Raw (sum)", "value": None, "z": None, "weight": None, "effect": float(last["raw"])},
                 ]
             )
-
-            drivers["z"] = drivers["z"].apply(fmt_optional)
-            drivers["weight"] = drivers["weight"].apply(fmt_optional)
-            drivers["effect"] = drivers["effect"].apply(fmt_optional)
-
-            st.data_editor(
-                drivers,
-                use_container_width=True,
-                hide_index=True,
-                disabled=True,
-                column_config={
-                    "component": st.column_config.TextColumn(
-                        "component",
-                        help=(
-                            "Which signal this row represents.\n\n"
-                            "- tension_core (tone): negativity in article tone\n"
-                            "- diplomacy_share: fraction of coverage mentioning negotiation/peace themes\n"
-                            "- articles: deduplicated article count (context)"
-                        ),
-                    ),
-                    "value": st.column_config.NumberColumn(
-                        "value",
-                        format="%.3f",
-                        help=(
-                            "Raw value for this component on the latest day.\n\n"
-                            "- tension_core: average negative-tone intensity\n"
-                            "- diplomacy_share: 0..1 share of diplomatic coverage\n"
-                            "- articles: number of deduplicated articles that day"
-                        ),
-                    ),
-                    "z": st.column_config.NumberColumn(
-                        "z (std dev)",
-                        format="%.2f",
-                        help=(
-                            "Z-score = how unusual today's smoothed tension is vs recent history.\n"
-                            "z=(today-mean)/std. z=0 normal, z=+2 very unusual.\n"
-                            "Only computed for tension_core in this version."
-                        ),
-                    ),
-                    "weight": st.column_config.NumberColumn(
-                        "weight",
-                        format="%.2f",
-                        help=(
-                            "How strongly the component is applied.\n\n"
-                            "- tension_core uses 1.0\n"
-                            "- diplomacy_share uses the sidebar value\n"
-                            "- articles is context only"
-                        ),
-                    ),
-                    "effect": st.column_config.NumberColumn(
-                        "effect",
-                        format="%.3f",
-                        help=(
-                            "Contribution to the score input before mapping to 0–100.\n\n"
-                            "- tension_core effect ≈ z\n"
-                            "- diplomacy_share effect = -weight × diplomacy_share\n"
-                            "- articles has no direct effect"
-                        ),
-                    ),
-                },
-            )
+            st.dataframe(drivers, use_container_width=True, hide_index=True)
 
         st.subheader("Latest matching articles")
         if articles.empty:
@@ -790,7 +510,7 @@ with tab1:
             else:
                 tmp["dt"] = pd.NaT
 
-            latest = tmp.sort_values("dt", ascending=False).head(20)
+            latest = tmp.sort_values("dt", ascending=False).head(15)
             for _, row in latest.iterrows():
                 dt = row.get("dt")
                 dt_str = dt.strftime("%Y-%m-%d %H:%M UTC") if pd.notna(dt) else "—"
@@ -803,17 +523,34 @@ with tab1:
     with st.expander("Raw daily table"):
         st.dataframe(scored, use_container_width=True)
 
-with tab2:
-    st.subheader("Iran air-traffic signal (aggregated)")
-    st.caption("SQLite persists aggregate airborne counts so anomaly detection uses a stable baseline across restarts.")
-    st.write(f"Bounding box (Iran): lat {IR_LAMIN}–{IR_LAMAX}, lon {IR_LOMIN}–{IR_LOMAX}.")
-    st.write(air_msg)
 
-    if df24.empty:
-        st.info("Not enough samples yet to compute a stable baseline. Refresh occasionally to collect samples.")
+# -----------------------------
+# Tab 2: Model & Debug
+# -----------------------------
+with tab2:
+    st.subheader("What the model uses (GDELT-only)")
+    st.markdown(
+        """
+- **Tone negativity**: average magnitude of negative tone per article (smoothed + z-scored)  
+- **Intent keywords**: escalation hits minus de-escalation hits (per article; smoothed + z-scored)  
+- **Conflict themes share**: fraction of articles with conflict/military-related themes (smoothed + z-scored)  
+- **Volume spike**: articles/day z-score (how unusual coverage volume is)  
+- **Diplomacy share**: diplomacy-related themes z-score (subtracted as dampener)  
+- **Source diversity**: scales the score’s logit (more diverse sources => stronger confidence)
+        """
+    )
+
+    st.subheader("Debug: tone availability")
+    if articles.empty:
+        st.info("No articles loaded.")
     else:
-        plot_df = df24.copy()
-        plot_df["ts"] = pd.to_datetime(plot_df["ts"], utc=True)
-        fig = px.line(plot_df, x="ts", y="airborne", title="Airborne aircraft over Iran (SQLite samples, last 24h)")
-        st.plotly_chart(fig, use_container_width=True)
-        st.dataframe(plot_df.tail(50), use_container_width=True, hide_index=True)
+        tone_s = extract_tone_series(articles)
+        st.write("Article columns:", list(articles.columns))
+        st.write("Tone non-null count:", int(tone_s.notna().sum()))
+        st.write("Tone sample:", tone_s.dropna().head(10).tolist())
+
+    st.subheader("Keyword sets (current)")
+    st.write("Escalation keywords:", ESCALATION_KW)
+    st.write("De-escalation keywords:", DEESCALATION_KW)
+    st.write("Conflict theme needles:", CONFLICT_THEME_NEEDLES)
+    st.write("Diplomacy theme needles:", DIPLO_THEME_NEEDLES)
