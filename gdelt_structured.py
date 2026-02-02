@@ -9,53 +9,48 @@ def _dt(dt: datetime) -> str:
     # GDELT uses YYYYMMDDHHMMSS (UTC)
     return dt.strftime("%Y%m%d%H%M%S")
 
-def fetch_gdelt_articles(query: str, hours_back: int = 72, max_records: int = 250):
-    """
-    Fetch recent articles from GDELT DOC 2.1 in JSON.
-    NOTE: GDELT can throttle; keep max_records modest and cache in Streamlit.
-    """
-    end = datetime.now(timezone.utc)
-    start = end - timedelta(hours=hours_back)
+def fetch_gdelt_articles(query: str, hours_back: int, max_records: int) -> pd.DataFrame:
+    url = "https://api.gdeltproject.org/api/v2/doc/doc"
+    max_records = int(max_records)
+
+    # GDELT DOC can be flaky at high maxrecords; clamp to reduce non-JSON responses.
+    if max_records > 250:
+        max_records = 250
 
     params = {
         "query": query,
         "mode": "ArtList",
         "format": "json",
-        "startdatetime": _dt(start),
-        "enddatetime": _dt(end),
         "maxrecords": max_records,
-        "sort": "HybridRel",  # good default
+        "formatdatetime": "true",
+        "sort": "HybridRel",
+        "timespan": f"{int(hours_back)}h",
     }
 
-    r = requests.get(GDELT_DOC_ENDPOINT, params=params, timeout=20)
-    r.raise_for_status()
-    data = r.json()
-    arts = data.get("articles", [])
-    if not arts:
+    try:
+        r = requests.get(url, params=params, timeout=30, headers={"User-Agent": "tension-dashboard/1.0"})
+    except requests.RequestException:
+        return pd.DataFrame()
+
+    if r.status_code != 200:
+        return pd.DataFrame()
+
+    ctype = (r.headers.get("content-type") or "").lower()
+    if "json" not in ctype:
+        return pd.DataFrame()
+
+    try:
+        data = r.json()
+    except ValueError:
+        # Non-JSON or corrupt JSON
+        return pd.DataFrame()
+
+    arts = data.get("articles") or []
+    if not isinstance(arts, list) or not arts:
         return pd.DataFrame()
 
     df = pd.DataFrame(arts)
-
-    # Normalize common fields (GDELT sometimes omits some keys)
-    for col in ["url", "title", "domain", "seendate", "sourceCountry", "language", "tone"]:
-        if col not in df.columns:
-            df[col] = None
-
-    # Parse datetime
-    df["seendate"] = pd.to_datetime(df["seendate"], errors="coerce", utc=True)
-
-    # Tone to numeric
-    df["tone"] = pd.to_numeric(df["tone"], errors="coerce")
-
-    # Optional: themes (some responses include it; if absent, keep empty)
-    if "themes" in df.columns:
-        # themes is often a semicolon-delimited string
-        df["themes_list"] = df["themes"].fillna("").astype(str).str.split(";")
-    else:
-        df["themes_list"] = [[] for _ in range(len(df))]
-
     return df
-
 
 def dedupe_syndication(df: pd.DataFrame) -> pd.DataFrame:
     """
