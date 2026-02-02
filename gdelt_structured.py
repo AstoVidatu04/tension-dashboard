@@ -20,7 +20,7 @@ def _parse_seendate(series: pd.Series) -> pd.Series:
     GDELT 'seendate' can be:
       - YYYYMMDDHHMMSS (string)
       - ISO datetime string
-    Returns UTC pandas datetime (datetime64[ns, UTC]).
+    Returns UTC pandas datetime.
     """
     if series is None or len(series) == 0:
         return pd.to_datetime(pd.Series([], dtype="object"), utc=True, errors="coerce")
@@ -28,7 +28,7 @@ def _parse_seendate(series: pd.Series) -> pd.Series:
     s = series.astype(str).str.strip()
 
     mask_num = s.str.fullmatch(r"\d{14}")
-    out = pd.Series(pd.NaT, index=s.index, dtype="datetime64[ns, UTC]")
+    out = pd.Series(pd.NaT, index=s.index)
 
     if mask_num.any():
         out.loc[mask_num] = pd.to_datetime(
@@ -38,16 +38,15 @@ def _parse_seendate(series: pd.Series) -> pd.Series:
     if (~mask_num).any():
         out.loc[~mask_num] = pd.to_datetime(s.loc[~mask_num], utc=True, errors="coerce")
 
-    return out
+    # force dtype to datetime64[ns, UTC] when possible
+    return pd.to_datetime(out, utc=True, errors="coerce")
 
 
 def fetch_gdelt_articles(query: str, hours_back: int, max_records: int) -> pd.DataFrame:
     """
     Fetch GDELT DOC 2.1 articles (ArtList).
-
-    Notes:
-      - GDELT can return non-JSON under load or rate limiting.
-      - Large maxrecords is often flaky; we clamp to 250 for stability.
+    - Safe against non-JSON responses.
+    - Clamps maxrecords for stability.
     """
     max_records = int(max_records)
     if max_records > 250:
@@ -83,15 +82,15 @@ def fetch_gdelt_articles(query: str, hours_back: int, max_records: int) -> pd.Da
 
     df = pd.DataFrame(arts)
 
-    # Normalize columns so downstream code is stable
+    # Ensure expected columns exist
     for col in ["url", "title", "domain", "seendate", "tone", "themes_list"]:
         if col not in df.columns:
             df[col] = None
 
-    # Parse seendate safely (UTC)
+    # Parse seendate into UTC datetime
     df["seendate"] = _parse_seendate(df["seendate"])
 
-    # tone may be missing or stringy
+    # tone as numeric
     df["tone"] = pd.to_numeric(df["tone"], errors="coerce")
 
     return df
@@ -99,9 +98,12 @@ def fetch_gdelt_articles(query: str, hours_back: int, max_records: int) -> pd.Da
 
 def dedupe_syndication(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Light de-duplication:
-      - exact URL de-dupe
-      - title de-dupe within same UTC day (cheap heuristic)
+    De-duplicate:
+      - by URL
+      - by (UTC day + normalized title)
+
+    This version is bulletproof against pandas dtype issues:
+    it NEVER uses `.dt` on df['seendate'] directly.
     """
     if df is None or df.empty:
         return pd.DataFrame() if df is None else df
@@ -116,11 +118,7 @@ def dedupe_syndication(df: pd.DataFrame) -> pd.DataFrame:
     if "seendate" not in out.columns:
         out["seendate"] = pd.NaT
 
-    # CRITICAL FIX: force seendate to datetime so `.dt` always works
-    # This protects against mixed dtype/object columns.
-    out["seendate"] = pd.to_datetime(out["seendate"], utc=True, errors="coerce")
-
-    # Exact URL dedupe
+    # URL dedupe
     out = out.drop_duplicates(subset=["url"]).copy()
 
     # Title canonicalization
@@ -132,9 +130,14 @@ def dedupe_syndication(df: pd.DataFrame) -> pd.DataFrame:
         .str.strip()
     )
 
-    # Day bucketing (fallback if all dates missing)
-    if out["seendate"].notna().any():
-        out["_day"] = out["seendate"].dt.floor("D")
+    # Build a fresh datetime series (safe) and bucket to day WITHOUT `.dt` on out["seendate"]
+    se = pd.to_datetime(out["seendate"], utc=True, errors="coerce")
+
+    if se.notna().any():
+        # Convert to naive numpy day buckets: datetime64[D]
+        se_naive = pd.to_datetime(se, utc=True, errors="coerce").dt.tz_convert(None)
+        day_bucket = se_naive.to_numpy(dtype="datetime64[D]")
+        out["_day"] = pd.to_datetime(day_bucket)
     else:
         out["_day"] = pd.Timestamp.utcnow().floor("D")
 
@@ -168,7 +171,7 @@ def structured_signal_score(df: pd.DataFrame) -> dict:
     """
     Output:
       - tension_core: based on negative tone intensity
-      - diplomacy_share: share of diplomacy/negotiation themed coverage (if themes exist)
+      - diplomacy_share: share of diplomacy/negotiation themed coverage
       - uncertainty: proxy based on volume + diversity
     """
     if df is None or df.empty:
@@ -176,12 +179,12 @@ def structured_signal_score(df: pd.DataFrame) -> dict:
 
     n = max(len(df), 1)
 
-    # Tone (safe)
+    # Tone
     tone = pd.to_numeric(df.get("tone", pd.Series([pd.NA] * len(df))), errors="coerce").clip(-10, 10)
     neg_mass = float((-tone[tone < 0]).sum()) if tone.notna().any() else 0.0
     tension_core = float(neg_mass / n)
 
-    # Diplomacy share from themes_list (safe)
+    # Diplomacy share from themes_list
     dip_keywords = {"NEGOTIATIONS", "MEDIATION", "DIPLOMACY", "PEACE", "CEASEFIRE", "TREATY"}
     themes = df.get("themes_list", pd.Series([None] * len(df)))
 
