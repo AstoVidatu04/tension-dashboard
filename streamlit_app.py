@@ -11,7 +11,6 @@ import plotly.graph_objects as go
 import requests
 import sqlite3
 import streamlit as st
-import streamlit.components.v1 as components
 
 from gdelt_structured import (
     fetch_gdelt_articles as fetch_gdelt_articles_structured,
@@ -87,47 +86,7 @@ def fmt_optional(x):
     return x
 
 
-def classify_risk(score: float) -> Tuple[str, str]:
-    if score is None or (isinstance(score, float) and math.isnan(score)):
-        return "NO DATA", "#6b7280"
-    s = float(score)
-    if s < 25:
-        return "LOW RISK", "#22c55e"
-    if s < 50:
-        return "GUARDED", "#eab308"
-    if s < 75:
-        return "ELEVATED", "#f97316"
-    return "HIGH RISK", "#ef4444"
-
-
-def make_compact_gauge(score: float, color: str) -> go.Figure:
-    val = 0.0 if score is None or (isinstance(score, float) and math.isnan(score)) else float(score)
-
-    fig = go.Figure(
-        go.Indicator(
-            mode="gauge",
-            value=val,
-            gauge={
-                "shape": "angular",
-                "axis": {"range": [0, 100], "visible": False},
-                "bar": {"color": color, "thickness": 0.30},
-                "bgcolor": "rgba(0,0,0,0)",
-                "borderwidth": 0,
-                "steps": [{"range": [0, 100], "color": "rgba(255,255,255,0.08)"}],
-            },
-            domain={"x": [0, 1], "y": [0, 1]},
-        )
-    )
-    fig.update_layout(
-        height=200,
-        margin=dict(l=10, r=10, t=0, b=0),
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
-    )
-    return fig
-
-
-def risk_meter(score: float, title: str) -> go.Figure:
+def risk_meter(score: float, title: str):
     if score is None or (isinstance(score, float) and math.isnan(score)):
         val = 0.0
         suffix = ""
@@ -164,110 +123,6 @@ def risk_meter(score: float, title: str) -> go.Figure:
     )
     fig.update_layout(height=230, margin=dict(l=10, r=10, t=45, b=10))
     return fig
-
-
-def radar_card(score: float, title: str, subtitle: str, updated_dt: datetime, next_update_seconds: int):
-    label, color = classify_risk(score)
-
-    mins_ago = int((utc_now() - updated_dt).total_seconds() // 60)
-    mm = max(0, int(next_update_seconds // 60))
-    ss = max(0, int(next_update_seconds % 60))
-    countdown = f"{mm:02d}:{ss:02d}"
-
-    pct = 0 if score is None or (isinstance(score, float) and math.isnan(score)) else int(round(float(score)))
-
-    st.markdown(
-        """
-        <style>
-          .sr-card {
-            background: rgba(255,255,255,0.04);
-            border: 1px solid rgba(255,255,255,0.08);
-            border-radius: 22px;
-            padding: 16px 16px 14px 16px;
-            box-shadow: 0 10px 30px rgba(0,0,0,0.35);
-          }
-          .sr-pill {
-            display:inline-block;
-            padding:6px 14px;
-            border-radius:999px;
-            font-weight:800;
-            font-size:12px;
-            color:#0b0b0b;
-          }
-          .sr-title {
-            font-size:13px;
-            letter-spacing:0.10em;
-            opacity:0.85;
-            text-align:center;
-          }
-          .sr-sub {
-            font-size:12px;
-            opacity:0.65;
-            margin-top:4px;
-            text-align:center;
-          }
-          .sr-top {
-            display:flex;
-            justify-content:space-between;
-            align-items:center;
-            gap:12px;
-            opacity:0.85;
-            font-size:13px;
-          }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    st.markdown('<div class="sr-card">', unsafe_allow_html=True)
-
-    top_l, top_r = st.columns([1, 1])
-    with top_l:
-        st.markdown(f'<div class="sr-top">Updated <b>{mins_ago} min ago</b> · UTC</div>', unsafe_allow_html=True)
-    with top_r:
-        st.markdown(f'<div class="sr-top" style="justify-content:flex-end;">Next update in <b>{countdown}</b></div>', unsafe_allow_html=True)
-
-    st.markdown(f'<div class="sr-title">{title}</div>', unsafe_allow_html=True)
-    st.markdown(f'<div class="sr-sub">{subtitle}</div>', unsafe_allow_html=True)
-
-    st.markdown(
-        f'<div style="text-align:center; margin-top:10px;"><span class="sr-pill" style="background:{color};">{label}</span></div>',
-        unsafe_allow_html=True,
-    )
-
-    # Gauge + big percent overlay (all Streamlit-native)
-    gauge_col = st.columns([1])[0]
-    with gauge_col:
-        fig = make_compact_gauge(score, color)
-        st.plotly_chart(fig, use_container_width=True)
-
-        st.markdown(
-            f"""
-            <div style="text-align:center; margin-top:-120px;">
-              <div style="font-size:56px; font-weight:900; color:{color}; line-height:1;">{pct}%</div>
-              <div style="font-size:12px; opacity:0.65; margin-top:6px;">Projected Risk: Next 8 Hours</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-    st.markdown("</div>", unsafe_allow_html=True)
-
-
-def live_tick(enable: bool):
-    if not enable:
-        return
-    components.html(
-        """
-<script>
-  setTimeout(() => {
-    window.parent.postMessage({type: "streamlit:rerun"}, "*");
-  }, 1000);
-</script>
-        """,
-        height=0,
-        width=0,
-    )
 
 
 @st.cache_data(ttl=60 * 60, show_spinner=False)
@@ -592,9 +447,7 @@ with st.sidebar:
     enable_air_signal = st.checkbox("Enable Iran air-traffic signal", value=True)
     w_air_traffic = st.slider("Air traffic impact (↑ when traffic drops)", 0.0, 3.0, 1.0, 0.1)
 
-    st.header("Updates")
-    auto_refresh = st.checkbox("Live countdown", value=True)
-    update_interval = st.slider("Update interval (minutes)", 1, 15, 5)
+    st.header("Controls")
     refresh = st.button("Refresh now")
 
     st.subheader("Flight DB maintenance")
@@ -605,191 +458,110 @@ with st.sidebar:
 
 if "last_refresh_ts" not in st.session_state:
     st.session_state["last_refresh_ts"] = 0.0
-if "last_data_update_dt" not in st.session_state:
-    st.session_state["last_data_update_dt"] = utc_now()
-if "snapshot" not in st.session_state:
-    st.session_state["snapshot"] = None
 
 cooldown_seconds = 30
-update_seconds = int(update_interval) * 60
-
-now_dt = utc_now()
-elapsed_since_update = int((now_dt - st.session_state["last_data_update_dt"]).total_seconds())
-remaining_to_update = max(0, update_seconds - elapsed_since_update)
-
-force_update = False
 cache_key = "stable"
-
 if refresh:
     now_ts = time.time()
     if now_ts - st.session_state["last_refresh_ts"] < cooldown_seconds:
         st.warning(f"Please wait {cooldown_seconds} seconds between refreshes.")
     else:
         st.session_state["last_refresh_ts"] = now_ts
-        force_update = True
+        cache_key = utc_now().strftime("%Y%m%d%H%M%S")
 
-due_update = remaining_to_update <= 0
-if st.session_state["snapshot"] is None:
-    force_update = True
+end_dt = utc_now()
+hours_back = int(window_days) * 24
 
-if force_update or due_update:
-    cache_key = utc_now().strftime("%Y%m%d%H%M%S")
-    end_dt = utc_now()
-    hours_back = int(window_days) * 24
+with st.spinner("Fetching GDELT articles…"):
+    articles = cached_fetch_structured(query=query, hours_back=hours_back, max_records=maxrecords, cache_key=cache_key)
 
-    with st.spinner("Fetching GDELT articles…"):
-        articles = cached_fetch_structured(query=query, hours_back=hours_back, max_records=maxrecords, cache_key=cache_key)
+articles = dedupe_syndication(articles) if articles is not None else pd.DataFrame()
 
-    articles = dedupe_syndication(articles) if articles is not None else pd.DataFrame()
+div_mult = source_diversity_factor(articles) if not articles.empty else 0.8
+sig = (
+    structured_signal_score(articles)
+    if not articles.empty
+    else {"tension_core": 0.0, "diplomacy_share": 0.0, "uncertainty": 1.0}
+)
 
-    div_mult = source_diversity_factor(articles) if not articles.empty else 0.8
-    sig = (
-        structured_signal_score(articles)
-        if not articles.empty
-        else {"tension_core": 0.0, "diplomacy_share": 0.0, "uncertainty": 1.0}
-    )
+daily = build_daily_structured_features(articles)
+scored = compute_structured_score_series(daily, smooth_days=smooth_days, diplomacy_weight=diplomacy_weight)
 
-    daily = build_daily_structured_features(articles)
-    scored = compute_structured_score_series(daily, smooth_days=smooth_days, diplomacy_weight=diplomacy_weight)
+base_latest_score = float(scored["score"].iloc[-1]) if len(scored) else float("nan")
 
-    base_latest_score = float(scored["score"].iloc[-1]) if len(scored) else float("nan")
-    if not math.isnan(base_latest_score):
-        raw = logit_from_0_100(base_latest_score)
-        raw *= float(div_mult)
-        base_latest_score = logistic_0_100(raw)
+if not math.isnan(base_latest_score):
+    raw = logit_from_0_100(base_latest_score)
+    raw *= float(div_mult)
+    base_latest_score = logistic_0_100(raw)
 
-    band = int(round(8 * float(sig.get("uncertainty", 1.0))))
-    low_band = None
-    high_band = None
-    if not math.isnan(base_latest_score):
-        low_band = max(0, int(round(base_latest_score - band)))
-        high_band = min(100, int(round(base_latest_score + band)))
+band = int(round(8 * float(sig.get("uncertainty", 1.0))))
+low_band = None
+high_band = None
+if not math.isnan(base_latest_score):
+    low_band = max(0, int(round(base_latest_score - band)))
+    high_band = min(100, int(round(base_latest_score + band)))
 
-    shift_flag = False
-    if not scored.empty:
-        shift_flag = shift_detected(scored["score"].astype(float).tolist())
+shift_flag = False
+if not scored.empty:
+    shift_flag = shift_detected(scored["score"].astype(float).tolist())
 
-    shipping_mult = 1.0
-    shipping_articles_count = 0
-    if enable_shipping_amp:
-        with st.spinner("Fetching shipping disruption volume…"):
-            ship_df = cached_fetch_structured(
-                query=shipping_query, hours_back=72, max_records=250, cache_key="ship-" + cache_key
-            )
-        ship_df = dedupe_syndication(ship_df) if ship_df is not None else pd.DataFrame()
-        shipping_articles_count = int(len(ship_df))
-        if shipping_articles_count >= 40:
-            shipping_mult = 1.05
-        if shipping_articles_count >= 80:
-            shipping_mult = 1.10
+shipping_mult = 1.0
+shipping_articles_count = 0
+if enable_shipping_amp:
+    with st.spinner("Fetching shipping disruption volume…"):
+        ship_df = cached_fetch_structured(
+            query=shipping_query, hours_back=72, max_records=250, cache_key="ship-" + cache_key
+        )
+    ship_df = dedupe_syndication(ship_df) if ship_df is not None else pd.DataFrame()
+    shipping_articles_count = int(len(ship_df))
+    if shipping_articles_count >= 40:
+        shipping_mult = 1.05
+    if shipping_articles_count >= 80:
+        shipping_mult = 1.10
 
-    mkt_mult = float(market_amplifier()) if enable_market_amp else 1.0
+mkt_mult = float(market_amplifier()) if enable_market_amp else 1.0
 
-    airborne_over_iran = None
-    air_msg = "Air traffic signal disabled."
-    flight_z = None
-    df24 = pd.DataFrame(columns=["ts", "airborne"])
+airborne_over_iran = None
+air_msg = "Air traffic signal disabled."
+flight_z = None
+df24 = pd.DataFrame(columns=["ts", "airborne"])
 
-    adjusted_latest_score = base_latest_score
+adjusted_latest_score = base_latest_score
 
-    if enable_air_signal:
-        with st.spinner("Fetching OpenSky air-traffic snapshot over Iran…"):
-            bucket = end_dt.replace(minute=(end_dt.minute // 10) * 10, second=0, microsecond=0)
-            os_cache_key = bucket.strftime("%Y%m%d%H%M")
-            count, air_msg = fetch_opensky_states_bbox(
-                cache_key=os_cache_key,
-                lamin=IR_LAMIN,
-                lamax=IR_LAMAX,
-                lomin=IR_LOMIN,
-                lomax=IR_LOMAX,
-            )
-            airborne_over_iran = int(count)
+if enable_air_signal:
+    with st.spinner("Fetching OpenSky air-traffic snapshot over Iran…"):
+        bucket = end_dt.replace(minute=(end_dt.minute // 10) * 10, second=0, microsecond=0)
+        os_cache_key = bucket.strftime("%Y%m%d%H%M")
+        count, air_msg = fetch_opensky_states_bbox(
+            cache_key=os_cache_key,
+            lamin=IR_LAMIN,
+            lamax=IR_LAMAX,
+            lomin=IR_LOMIN,
+            lomax=IR_LOMAX,
+        )
+        airborne_over_iran = int(count)
 
-            insert_flight_sample(end_dt, airborne_over_iran)
-            flight_z, df24 = compute_flight_z_baselined(
-                now_ts=end_dt,
-                baseline_days=28,
-                min_baseline_points=30,
-                lookback_hours_for_plot=24,
-            )
+        insert_flight_sample(end_dt, airborne_over_iran)
+        flight_z, df24 = compute_flight_z_baselined(
+            now_ts=end_dt,
+            baseline_days=28,
+            min_baseline_points=30,
+            lookback_hours_for_plot=24,
+        )
 
-        if flight_z is not None and not math.isnan(adjusted_latest_score):
-            raw = logit_from_0_100(adjusted_latest_score)
-            raw_adj = raw + (-w_air_traffic * float(flight_z))
-            adjusted_latest_score = logistic_0_100(raw_adj)
+    if flight_z is not None and not math.isnan(adjusted_latest_score):
+        raw = logit_from_0_100(adjusted_latest_score)
+        raw_adj = raw + (-w_air_traffic * float(flight_z))
+        adjusted_latest_score = logistic_0_100(raw_adj)
 
-    if not math.isnan(adjusted_latest_score):
-        adjusted_latest_score = float(adjusted_latest_score) * float(mkt_mult) * float(shipping_mult)
-        adjusted_latest_score = float(max(0.0, min(100.0, adjusted_latest_score)))
-
-    st.session_state["snapshot"] = dict(
-        end_dt=end_dt,
-        articles=articles,
-        scored=scored,
-        base_latest_score=base_latest_score,
-        adjusted_latest_score=adjusted_latest_score,
-        div_mult=div_mult,
-        sig=sig,
-        low_band=low_band,
-        high_band=high_band,
-        shift_flag=shift_flag,
-        shipping_mult=shipping_mult,
-        shipping_articles_count=shipping_articles_count,
-        mkt_mult=mkt_mult,
-        airborne_over_iran=airborne_over_iran,
-        air_msg=air_msg,
-        flight_z=flight_z,
-        df24=df24,
-        diplomacy_weight=diplomacy_weight,
-        w_air_traffic=w_air_traffic,
-        window_days=window_days,
-        enable_market_amp=enable_market_amp,
-        enable_shipping_amp=enable_shipping_amp,
-    )
-    st.session_state["last_data_update_dt"] = end_dt
-
-snap = st.session_state["snapshot"]
-end_dt = snap["end_dt"]
-articles = snap["articles"]
-scored = snap["scored"]
-base_latest_score = snap["base_latest_score"]
-adjusted_latest_score = snap["adjusted_latest_score"]
-div_mult = snap["div_mult"]
-sig = snap["sig"]
-low_band = snap["low_band"]
-high_band = snap["high_band"]
-shift_flag = snap["shift_flag"]
-shipping_mult = snap["shipping_mult"]
-shipping_articles_count = snap["shipping_articles_count"]
-mkt_mult = snap["mkt_mult"]
-airborne_over_iran = snap["airborne_over_iran"]
-air_msg = snap["air_msg"]
-flight_z = snap["flight_z"]
-df24 = snap["df24"]
-diplomacy_weight = snap["diplomacy_weight"]
-w_air_traffic = snap["w_air_traffic"]
-window_days = snap["window_days"]
-enable_market_amp = snap["enable_market_amp"]
-enable_shipping_amp = snap["enable_shipping_amp"]
-
-now_dt = utc_now()
-elapsed_since_update = int((now_dt - st.session_state["last_data_update_dt"]).total_seconds())
-remaining_to_update = max(0, update_seconds - elapsed_since_update)
-
-live_tick(auto_refresh)
+if not math.isnan(adjusted_latest_score):
+    adjusted_latest_score = float(adjusted_latest_score) * float(mkt_mult) * float(shipping_mult)
+    adjusted_latest_score = float(max(0.0, min(100.0, adjusted_latest_score)))
 
 with tab1:
-    radar_card(
-        score=adjusted_latest_score,
-        title="US–IRAN TENSION INDICATOR",
-        subtitle="Composite alert level (news + optional amplifiers)",
-        updated_dt=st.session_state["last_data_update_dt"],
-        next_update_seconds=remaining_to_update,
-    )
-
     st.info(
         "GDELT is cached (1 hour). OpenSky snapshot is cached (~10 minutes). "
-        "Market/shipping amplifiers apply to the latest score only."
+        "Market/shipping amplifiers adjust the latest score only."
     )
 
     if shift_flag:
@@ -959,7 +731,9 @@ with tab1:
 
 with tab2:
     st.subheader("Iran air-traffic signal (aggregated)")
-    st.caption("SQLite persists aggregate airborne counts so anomaly detection uses a stable baseline across restarts.")
+    st.caption(
+        "SQLite persists aggregate airborne counts so anomaly detection uses a stable baseline across restarts."
+    )
     st.write(f"Bounding box (Iran): lat {IR_LAMIN}–{IR_LAMAX}, lon {IR_LOMIN}–{IR_LOMAX}.")
     st.write(air_msg)
 

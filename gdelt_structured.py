@@ -98,19 +98,18 @@ def fetch_gdelt_articles(query: str, hours_back: int, max_records: int) -> pd.Da
 
 def dedupe_syndication(df: pd.DataFrame) -> pd.DataFrame:
     """
-    De-duplicate:
-      - by URL
-      - by (UTC day + normalized title)
+    Light de-duplication:
+      - exact URL de-dupe
+      - title de-dupe within the same UTC day (cheap heuristic)
 
-    This version is bulletproof against pandas dtype issues:
-    it NEVER uses `.dt` on df['seendate'] directly.
+    This version forces datetime conversion at the point of use to avoid
+    pandas `.dt` accessor errors on mixed/object columns.
     """
     if df is None or df.empty:
         return pd.DataFrame() if df is None else df
 
     out = df.copy()
 
-    # Ensure required columns exist
     if "url" not in out.columns:
         out["url"] = None
     if "title" not in out.columns:
@@ -118,10 +117,8 @@ def dedupe_syndication(df: pd.DataFrame) -> pd.DataFrame:
     if "seendate" not in out.columns:
         out["seendate"] = pd.NaT
 
-    # URL dedupe
     out = out.drop_duplicates(subset=["url"]).copy()
 
-    # Title canonicalization
     title = out["title"].fillna("").astype(str)
     out["_tcanon"] = (
         title.str.lower()
@@ -130,19 +127,16 @@ def dedupe_syndication(df: pd.DataFrame) -> pd.DataFrame:
         .str.strip()
     )
 
-    # Build a fresh datetime series (safe) and bucket to day WITHOUT `.dt` on out["seendate"]
     se = pd.to_datetime(out["seendate"], utc=True, errors="coerce")
 
     if se.notna().any():
-        # Convert to naive numpy day buckets: datetime64[D]
-        se_naive = pd.to_datetime(se, utc=True, errors="coerce").dt.tz_convert(None)
-        day_bucket = se_naive.to_numpy(dtype="datetime64[D]")
-        out["_day"] = pd.to_datetime(day_bucket)
+        out["_day"] = se.dt.floor("D")
     else:
         out["_day"] = pd.Timestamp.utcnow().floor("D")
 
     out = out.drop_duplicates(subset=["_day", "_tcanon"]).drop(columns=["_tcanon", "_day"])
     return out
+
 
 
 def source_diversity_factor(df: pd.DataFrame) -> float:
