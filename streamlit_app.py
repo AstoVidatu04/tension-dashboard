@@ -1,4 +1,3 @@
-```python
 import math
 import time
 from datetime import datetime, timedelta, timezone
@@ -774,4 +773,3 @@ with tab2:
         fig = px.line(plot_df, x="ts", y="airborne", title="Airborne aircraft over Iran (SQLite samples, last 24h)")
         st.plotly_chart(fig, use_container_width=True)
         st.dataframe(plot_df.tail(50), use_container_width=True, hide_index=True)
-```
