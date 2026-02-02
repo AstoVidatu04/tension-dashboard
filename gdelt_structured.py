@@ -1,6 +1,5 @@
 import pandas as pd
 import requests
-from datetime import datetime, timezone
 from typing import Any, Dict
 
 GDELT_DOC_ENDPOINT = "https://api.gdeltproject.org/api/v2/doc/doc"
@@ -21,21 +20,21 @@ def _parse_seendate(series: pd.Series) -> pd.Series:
     GDELT 'seendate' can be:
       - YYYYMMDDHHMMSS (string)
       - ISO datetime string
-    Returns UTC pandas datetime.
+    Returns UTC pandas datetime (datetime64[ns, UTC]).
     """
-    if series is None or series.empty:
+    if series is None or len(series) == 0:
         return pd.to_datetime(pd.Series([], dtype="object"), utc=True, errors="coerce")
 
     s = series.astype(str).str.strip()
 
-    # If numeric-like YYYYMMDDHHMMSS, parse via format first
     mask_num = s.str.fullmatch(r"\d{14}")
     out = pd.Series(pd.NaT, index=s.index, dtype="datetime64[ns, UTC]")
 
     if mask_num.any():
-        out.loc[mask_num] = pd.to_datetime(s.loc[mask_num], format="%Y%m%d%H%M%S", utc=True, errors="coerce")
+        out.loc[mask_num] = pd.to_datetime(
+            s.loc[mask_num], format="%Y%m%d%H%M%S", utc=True, errors="coerce"
+        )
 
-    # Fallback parse for the rest
     if (~mask_num).any():
         out.loc[~mask_num] = pd.to_datetime(s.loc[~mask_num], utc=True, errors="coerce")
 
@@ -47,7 +46,7 @@ def fetch_gdelt_articles(query: str, hours_back: int, max_records: int) -> pd.Da
     Fetch GDELT DOC 2.1 articles (ArtList).
 
     Notes:
-      - GDELT DOC can return non-JSON under load/rate-limits.
+      - GDELT can return non-JSON under load or rate limiting.
       - Large maxrecords is often flaky; we clamp to 250 for stability.
     """
     max_records = int(max_records)
@@ -84,26 +83,16 @@ def fetch_gdelt_articles(query: str, hours_back: int, max_records: int) -> pd.Da
 
     df = pd.DataFrame(arts)
 
-    # Normalize expected columns so downstream code is stable
-    if "seendate" in df.columns:
-        df["seendate"] = _parse_seendate(df["seendate"])
-    else:
-        df["seendate"] = pd.NaT
-
-    # Ensure these exist (avoid KeyError in later steps)
-    for col in ["url", "title", "domain"]:
+    # Normalize columns so downstream code is stable
+    for col in ["url", "title", "domain", "seendate", "tone", "themes_list"]:
         if col not in df.columns:
             df[col] = None
 
-    # tone may be missing or stringy
-    if "tone" in df.columns:
-        df["tone"] = pd.to_numeric(df["tone"], errors="coerce")
-    else:
-        df["tone"] = pd.NA
+    # Parse seendate safely (UTC)
+    df["seendate"] = _parse_seendate(df["seendate"])
 
-    # themes_list sometimes absent; keep as is if present
-    if "themes_list" not in df.columns:
-        df["themes_list"] = None
+    # tone may be missing or stringy
+    df["tone"] = pd.to_numeric(df["tone"], errors="coerce")
 
     return df
 
@@ -119,32 +108,35 @@ def dedupe_syndication(df: pd.DataFrame) -> pd.DataFrame:
 
     out = df.copy()
 
-    # Ensure seendate is datetime
-    if "seendate" in out.columns:
-        if not pd.api.types.is_datetime64_any_dtype(out["seendate"]):
-            out["seendate"] = _parse_seendate(out["seendate"])
-    else:
+    # Ensure required columns exist
+    if "url" not in out.columns:
+        out["url"] = None
+    if "title" not in out.columns:
+        out["title"] = None
+    if "seendate" not in out.columns:
         out["seendate"] = pd.NaT
 
-    # Exact URL dedupe (if url exists)
-    if "url" in out.columns:
-        out = out.drop_duplicates(subset=["url"]).copy()
+    # CRITICAL FIX: force seendate to datetime so `.dt` always works
+    # This protects against mixed dtype/object columns.
+    out["seendate"] = pd.to_datetime(out["seendate"], utc=True, errors="coerce")
+
+    # Exact URL dedupe
+    out = out.drop_duplicates(subset=["url"]).copy()
 
     # Title canonicalization
-    title = out.get("title", pd.Series([""] * len(out))).fillna("").astype(str)
-    tcanon = (
+    title = out["title"].fillna("").astype(str)
+    out["_tcanon"] = (
         title.str.lower()
         .str.replace(r"\s+", " ", regex=True)
         .str.replace(r"[^a-z0-9 ]+", "", regex=True)
         .str.strip()
     )
-    out["_tcanon"] = tcanon
 
-    # Day bucketing; if seendate missing -> treat all as same bucket
+    # Day bucketing (fallback if all dates missing)
     if out["seendate"].notna().any():
         out["_day"] = out["seendate"].dt.floor("D")
     else:
-        out["_day"] = pd.Timestamp.now(tz=timezone.utc).floor("D")
+        out["_day"] = pd.Timestamp.utcnow().floor("D")
 
     out = out.drop_duplicates(subset=["_day", "_tcanon"]).drop(columns=["_tcanon", "_day"])
     return out
@@ -161,7 +153,6 @@ def source_diversity_factor(df: pd.DataFrame) -> float:
     dom = df.get("domain", pd.Series(["unknown"] * len(df))).fillna("unknown")
     n = len(df)
     d = int(dom.nunique())
-
     ratio = d / max(n, 1)
 
     if d <= 3 and n >= 20:
@@ -175,9 +166,9 @@ def source_diversity_factor(df: pd.DataFrame) -> float:
 
 def structured_signal_score(df: pd.DataFrame) -> dict:
     """
-    Outputs:
-      - tension_core: average negative tone intensity (volume-normalized)
-      - diplomacy_share: share of diplomacy/negotiation themed coverage
+    Output:
+      - tension_core: based on negative tone intensity
+      - diplomacy_share: share of diplomacy/negotiation themed coverage (if themes exist)
       - uncertainty: proxy based on volume + diversity
     """
     if df is None or df.empty:
@@ -185,12 +176,12 @@ def structured_signal_score(df: pd.DataFrame) -> dict:
 
     n = max(len(df), 1)
 
-    # Tone
+    # Tone (safe)
     tone = pd.to_numeric(df.get("tone", pd.Series([pd.NA] * len(df))), errors="coerce").clip(-10, 10)
     neg_mass = float((-tone[tone < 0]).sum()) if tone.notna().any() else 0.0
     tension_core = float(neg_mass / n)
 
-    # Diplomacy share from themes_list
+    # Diplomacy share from themes_list (safe)
     dip_keywords = {"NEGOTIATIONS", "MEDIATION", "DIPLOMACY", "PEACE", "CEASEFIRE", "TREATY"}
     themes = df.get("themes_list", pd.Series([None] * len(df)))
 
@@ -206,10 +197,7 @@ def structured_signal_score(df: pd.DataFrame) -> dict:
                     return True
         return False
 
-    if themes.notna().any():
-        diplomacy_share = float(themes.apply(is_diplomatic).sum() / n)
-    else:
-        diplomacy_share = 0.0
+    diplomacy_share = float(themes.apply(is_diplomatic).sum() / n) if len(themes) else 0.0
 
     # Uncertainty proxy
     dom = df.get("domain", pd.Series(["unknown"] * len(df))).fillna("unknown")
