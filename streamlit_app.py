@@ -1,3 +1,4 @@
+```python
 import math
 import time
 from datetime import datetime, timedelta, timezone
@@ -75,6 +76,56 @@ def shift_detected(series: List[float], recent: int = 7, prior: int = 21, z: flo
     if p.std() == 0:
         return False
     return abs(r.mean() - p.mean()) / p.std() >= z
+
+
+def risk_meter(score: float, title: str = "Adjusted score (latest)"):
+    """
+    Plotly gauge meter for a 0–100 score with colored bands.
+    """
+    import plotly.graph_objects as go
+
+    def _bar_color(v: float) -> str:
+        if v < 25:
+            return "#1f9d55"  # green
+        if v < 50:
+            return "#d4a106"  # yellow
+        if v < 75:
+            return "#cc6d1c"  # orange
+        return "#c0392b"  # red
+
+    if score is None or (isinstance(score, float) and math.isnan(score)):
+        val = 0.0
+        suffix = ""
+    else:
+        val = float(score)
+        suffix = "/100"
+
+    fig = go.Figure(
+        go.Indicator(
+            mode="gauge+number",
+            value=val,
+            number={"suffix": suffix, "font": {"size": 40}},
+            title={"text": title, "font": {"size": 18}},
+            gauge={
+                "axis": {"range": [0, 100], "tickwidth": 1},
+                "bar": {"color": _bar_color(val)},
+                "steps": [
+                    {"range": [0, 25], "color": "#2ecc71"},
+                    {"range": [25, 50], "color": "#f1c40f"},
+                    {"range": [50, 75], "color": "#e67e22"},
+                    {"range": [75, 100], "color": "#e74c3c"},
+                ],
+                "threshold": {
+                    "line": {"color": "#111111", "width": 4},
+                    "thickness": 0.75,
+                    "value": val,
+                },
+            },
+        )
+    )
+
+    fig.update_layout(height=240, margin=dict(l=10, r=10, t=60, b=10))
+    return fig
 
 
 # =============================
@@ -296,7 +347,7 @@ def compute_flight_z_baselined(
     base = hist[(hist["dow"] == dow) & (hist["hour"] == hour)].copy()
 
     if len(base) < min_baseline_points:
-        # fallback: z-score vs last 24h (still from sqlite, not session)
+        # fallback: z-score vs last 24h (still from sqlite)
         df24 = read_flight_samples(hours_back=lookback_hours_for_plot)
         if len(df24) < 6:
             return None, df24
@@ -427,7 +478,7 @@ st.caption("Structured news-derived tension indicator (GDELT) + aggregate air-tr
 
 tab1, tab2 = st.tabs(["Tension dashboard", "Air traffic signal"])
 
-# Sidebar controls (shared)
+# Sidebar controls
 with st.sidebar:
     st.header("GDELT")
     default_query = "(United States OR USA OR US) (Iran OR Iranian)"
@@ -486,7 +537,11 @@ with st.spinner("Fetching GDELT articles…"):
 articles = dedupe_syndication(articles) if articles is not None else pd.DataFrame()
 
 div_mult = source_diversity_factor(articles) if not articles.empty else 0.8
-sig = structured_signal_score(articles) if not articles.empty else {"tension_core": 0.0, "diplomacy_share": 0.0, "uncertainty": 1.0}
+sig = (
+    structured_signal_score(articles)
+    if not articles.empty
+    else {"tension_core": 0.0, "diplomacy_share": 0.0, "uncertainty": 1.0}
+)
 
 daily = build_daily_structured_features(articles)
 scored = compute_structured_score_series(daily, smooth_days=smooth_days, diplomacy_weight=diplomacy_weight)
@@ -590,14 +645,13 @@ with tab1:
     if shift_flag:
         st.warning("Regime shift detected: the last week differs materially from the prior baseline.")
 
-    # KPIs
-    c1, c2, c3, c4, c5 = st.columns(5)
+    # KPIs (meter in 2nd column)
+    c1, c2, c3, c4, c5 = st.columns([1, 1.4, 1, 1, 1])
 
     base_str = "—" if math.isnan(base_latest_score) else f"{base_latest_score:.1f}/100"
-    adj_str = "—" if math.isnan(adjusted_latest_score) else f"{adjusted_latest_score:.1f}/100"
 
     c1.metric("Base risk score (latest)", base_str)
-    c2.metric("Adjusted score (latest)", adj_str)
+    c2.plotly_chart(risk_meter(adjusted_latest_score, title="Adjusted score (latest)"), use_container_width=True)
     c3.metric("Articles (deduped)", f"{len(articles)}")
     c4.metric("Window", f"{window_days} days")
     c5.metric("Updated (UTC)", end_dt.strftime("%Y-%m-%d %H:%M"))
@@ -669,13 +723,7 @@ with tab1:
                         "weight": float(diplomacy_weight),
                         "effect": -float(diplomacy_weight) * float(last["diplomacy_share"]),
                     },
-                    {
-                        "component": "articles",
-                        "value": int(last["articles"]),
-                        "z": None,
-                        "weight": None,
-                        "effect": None,
-                    },
+                    {"component": "articles", "value": int(last["articles"]), "z": None, "weight": None, "effect": None},
                 ]
             )
             st.dataframe(drivers, use_container_width=True, hide_index=True)
@@ -726,3 +774,4 @@ with tab2:
         fig = px.line(plot_df, x="ts", y="airborne", title="Airborne aircraft over Iran (SQLite samples, last 24h)")
         st.plotly_chart(fig, use_container_width=True)
         st.dataframe(plot_df.tail(50), use_container_width=True, hide_index=True)
+```
