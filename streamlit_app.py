@@ -174,7 +174,8 @@ with tab1:
         top_domains = dom.value_counts().head(8)
         top_share = float(top_domains.iloc[0] / max(len(dom), 1)) if len(top_domains) else 0.0
         st.write(f"Top source share: {top_share:.1%}")
-        st.dataframe(top_domains.reset_index().rename(columns={"index": "domain", "domain": "count"}), hide_index=True)
+        top_domains_df = top_domains.rename_axis("domain").reset_index(name="count")
+        st.dataframe(top_domains_df, hide_index=True)
         if top_share >= 0.45 and len(dom) >= 30:
             st.warning(
                 "A single domain dominates the feed. Reliability may be lower; "
