@@ -63,6 +63,17 @@ end_dt = utc_now()
 with st.spinner("Fetching GDELT articles…"):
     articles = fetch_and_dedupe(query=query, hours_back=hours_back, max_records=maxrecords, cache_key=cache_key)
 
+data_updated_dt = end_dt
+if not articles.empty:
+    if "seendate" in articles.columns:
+        _dt = pd.to_datetime(articles["seendate"], errors="coerce", utc=True)
+    elif "datetime" in articles.columns:
+        _dt = pd.to_datetime(articles["datetime"], errors="coerce", utc=True)
+    else:
+        _dt = pd.Series([pd.NaT] * len(articles))
+    if _dt.notna().any():
+        data_updated_dt = _dt.max().to_pydatetime()
+
 div_mult = source_diversity_factor(articles) if not articles.empty else 0.9
 
 daily = build_daily_features(articles)
@@ -84,7 +95,7 @@ if len(scored) >= 10 and not math.isnan(comp_adj):
 
 with tab1:
     st.info(
-        "GDELT cached (~1 hour). Scores: Diplomatic, Military, Economic + composite. "
+        "GDELT cached (~15 minutes). Scores: Diplomatic, Military, Economic + composite. "
         "Source diversity adjusts confidence for composite only."
     )
 
@@ -93,7 +104,7 @@ with tab1:
     c2.plotly_chart(risk_meter(mil_latest, "Military risk"), use_container_width=True)
     c3.plotly_chart(risk_meter(econ_latest, "Economic risk"), use_container_width=True)
     c4.metric("Articles (deduped)", f"{len(articles)}")
-    c5.metric("Updated (UTC)", end_dt.strftime("%Y-%m-%d %H:%M"))
+    c5.metric("Updated (UTC)", data_updated_dt.strftime("%Y-%m-%d %H:%M"))
 
     b1, b2, b3, b4 = st.columns(4)
     b1.metric("Composite (base)", "—" if math.isnan(comp_latest) else f"{comp_latest:.1f}/100")

@@ -7,7 +7,7 @@ from gdelt_structured import fetch_gdelt_articles as fetch_gdelt_articles_struct
 from gdelt_structured import dedupe_syndication
 
 
-@st.cache_data(ttl=60 * 60, show_spinner=False)
+@st.cache_data(ttl=15 * 60, show_spinner=False)
 def fetch_articles_cached(query: str, hours_back: int, max_records: int, cache_key: str = "stable") -> pd.DataFrame:
     """Cached fetch to avoid hammering GDELT."""
     _ = cache_key

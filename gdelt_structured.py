@@ -26,7 +26,8 @@ def fetch_gdelt_articles(query: str, hours_back: int, max_records: int) -> pd.Da
         "format": "json",
         "maxrecords": max_records,
         "formatdatetime": "true",
-        "sort": "HybridRel",
+        # Prefer recency so "latest topics" are actually included in the fetch.
+        "sort": "DateDesc",
         "timespan": f"{int(hours_back)}h",
     }
 
