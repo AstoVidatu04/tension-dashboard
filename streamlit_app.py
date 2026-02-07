@@ -92,6 +92,9 @@ if not articles.empty:
         _dt = pd.Series([pd.NaT] * len(articles))
     if _dt.notna().any():
         data_updated_dt = _dt.max().to_pydatetime()
+    data_age_minutes = int((end_dt - data_updated_dt).total_seconds() // 60) if data_updated_dt else None
+else:
+    data_age_minutes = None
 
 div_mult = source_diversity_factor(articles) if not articles.empty else 0.9
 
@@ -148,6 +151,12 @@ with tab1:
     c4.metric("Articles (deduped)", f"{len(articles)}")
     c5.metric("Updated (UTC)", data_updated_dt.strftime("%Y-%m-%d %H:%M"))
 
+    if data_age_minutes is not None and data_age_minutes > 180:
+        st.warning(
+            f"Latest article is {data_age_minutes} minutes old. "
+            "Results may be stale; try Refresh or broaden the query."
+        )
+
     b1, b2, b3, b4 = st.columns(4)
     b1.metric("Composite (base)", "—" if math.isnan(comp_latest) else f"{comp_latest:.1f}/100")
     b2.metric("Composite (adjusted)", "—" if math.isnan(comp_adj) else f"{comp_adj:.1f}/100")
@@ -158,6 +167,19 @@ with tab1:
     st.metric("Composite label", lbl)
 
     st.divider()
+
+    if not articles.empty:
+        st.subheader("Source quality")
+        dom = articles.get("domain", pd.Series(["unknown"] * len(articles))).fillna("unknown")
+        top_domains = dom.value_counts().head(8)
+        top_share = float(top_domains.iloc[0] / max(len(dom), 1)) if len(top_domains) else 0.0
+        st.write(f"Top source share: {top_share:.1%}")
+        st.dataframe(top_domains.reset_index().rename(columns={"index": "domain", "domain": "count"}), hide_index=True)
+        if top_share >= 0.45 and len(dom) >= 30:
+            st.warning(
+                "A single domain dominates the feed. Reliability may be lower; "
+                "consider broadening the query or increasing max records."
+            )
 
     left, right = st.columns([1.35, 1])
 
@@ -233,3 +255,32 @@ with tab2:
 - Composite is adjusted by source diversity multiplier (logit-space scaling).
 """
     )
+
+    st.subheader("Data diagnostics")
+    if scored.empty:
+        st.write("No data available.")
+    else:
+        nonzero_days = int((daily["articles"] > 0).sum()) if "articles" in daily.columns else 0
+        date_min = str(daily["date"].min()) if "date" in daily.columns and len(daily) else "—"
+        date_max = str(daily["date"].max()) if "date" in daily.columns and len(daily) else "—"
+
+        diag = {
+            "days_total": int(len(daily)),
+            "days_with_articles": nonzero_days,
+            "date_min": date_min,
+            "date_max": date_max,
+            "std_tone_sm": float(daily["neg_tone_mean"].std(ddof=0)) if "neg_tone_mean" in daily.columns else 0.0,
+            "std_intent_net": float(daily["intent_net"].std(ddof=0)) if "intent_net" in daily.columns else 0.0,
+            "std_conflict_share": float(daily["conflict_share"].std(ddof=0)) if "conflict_share" in daily.columns else 0.0,
+            "std_mil_rate": float(daily["mil_rate"].std(ddof=0)) if "mil_rate" in daily.columns else 0.0,
+            "std_econ_rate": float(daily["econ_rate"].std(ddof=0)) if "econ_rate" in daily.columns else 0.0,
+            "std_articles": float(daily["articles"].astype(float).std(ddof=0)) if "articles" in daily.columns else 0.0,
+        }
+        st.json(diag)
+
+        if nonzero_days <= 2 or all(v == 0.0 for k, v in diag.items() if k.startswith("std_")):
+            st.warning(
+                "Scores are likely ~50 because the underlying signals have near-zero variance "
+                "or data exists on only 1–2 days. Increase lookback, broaden query, or use "
+                "a higher max records to introduce variability."
+            )
