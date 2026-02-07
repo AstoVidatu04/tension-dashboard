@@ -31,11 +31,21 @@ st.caption(
 
 tab1, tab2 = st.tabs(["Tension dashboard", "Model & debug"])
 
+DEFAULT_PIZZA_QUERY = (
+    '(pizza OR pizzeria OR "pizza delivery") '
+    '(Pentagon OR Arlington OR "Washington DC" OR "National Capital Region")'
+)
+
 with st.sidebar:
     st.header("GDELT")
     query = st.text_input("GDELT query", value=DEFAULT_QUERY)
     window_days = st.slider("Lookback (days)", 7, 180, DEFAULT_WINDOW_DAYS)
     maxrecords = st.slider("Max articles to fetch", 50, 500, DEFAULT_MAXRECORDS, step=25)
+
+    st.header("Pentagon Pizza Index")
+    pizza_query = st.text_input("Pizza query", value=DEFAULT_PIZZA_QUERY)
+    pizza_window_days = st.slider("Pizza lookback (days)", 7, 90, 30)
+    pizza_maxrecords = st.slider("Pizza max records", 50, 250, 150, step=25)
 
     st.header("Scoring")
     smooth_days = st.slider("Smoothing (days)", 1, 14, 3)
@@ -63,6 +73,15 @@ end_dt = utc_now()
 with st.spinner("Fetching GDELT articles…"):
     articles = fetch_and_dedupe(query=query, hours_back=hours_back, max_records=maxrecords, cache_key=cache_key)
 
+with st.spinner("Fetching Pentagon pizza signal…"):
+    pizza_hours_back = int(pizza_window_days) * 24
+    pizza_articles = fetch_and_dedupe(
+        query=pizza_query,
+        hours_back=pizza_hours_back,
+        max_records=pizza_maxrecords,
+        cache_key="pizza-" + cache_key,
+    )
+
 data_updated_dt = end_dt
 if not articles.empty:
     if "seendate" in articles.columns:
@@ -86,6 +105,23 @@ comp_latest = float(scored["composite_score"].iloc[-1]) if len(scored) else floa
 
 comp_adj = apply_diversity_multiplier(comp_latest, div_mult) if not math.isnan(comp_latest) else float("nan")
 
+pizza_daily = build_daily_features(pizza_articles)
+pizza_scored = compute_subscores(pizza_daily, smooth_days=2)
+pizza_latest = float(pizza_scored["composite_score"].iloc[-1]) if len(pizza_scored) else float("nan")
+
+def pizza_status(score: float) -> str:
+    if score is None or (isinstance(score, float) and math.isnan(score)):
+        return "No data"
+    if score < 25:
+        return "Nothing Ever Happens"
+    if score < 45:
+        return "Chatter"
+    if score < 65:
+        return "Noticeable"
+    if score < 80:
+        return "Busy Night"
+    return "Red Alert"
+
 low_band = high_band = None
 if len(scored) >= 10 and not math.isnan(comp_adj):
     recent = scored["composite_score"].tail(14).astype(float)
@@ -98,6 +134,12 @@ with tab1:
         "GDELT cached (~15 minutes). Scores: Diplomatic, Military, Economic + composite. "
         "Source diversity adjusts confidence for composite only."
     )
+
+    st.subheader("Pentagon Pizza Index")
+    p1, p2 = st.columns([1.2, 1])
+    p1.plotly_chart(risk_meter(pizza_latest, "Pizza alarm"), use_container_width=True)
+    p2.metric("Status", pizza_status(pizza_latest))
+    p2.metric("Pizza articles (deduped)", f"{len(pizza_articles)}")
 
     c1, c2, c3, c4, c5 = st.columns([1.1, 1.1, 1.1, 1, 1])
     c1.plotly_chart(risk_meter(dip_latest, "Diplomatic risk"), use_container_width=True)
