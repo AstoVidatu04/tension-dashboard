@@ -42,8 +42,9 @@ DEPLOYMENT_REGION_KW = [
 
 DEPLOYMENT_ACTION_KW = [
     "deploy", "deployment", "deployed", "redeploy", "reposition", "surge",
-    "sent", "dispatch", "moved", "stationed", "arrived", "transfer",
-    "forward", "reinforcement", "tasked", "to the region",
+    "sent", "sending", "dispatch", "dispatched", "moved", "stationed", "arrived", "transfer",
+    "forward", "reinforcement", "tasked", "to the region", "to middle east", "to the middle east",
+    "to centcom", "forward-deployed",
 ]
 
 REGIONAL_ASSET_PATTERNS = {
@@ -285,9 +286,10 @@ def build_signal_intelligence(df_articles: pd.DataFrame) -> dict:
     deploy_cols = [
         "asset", "deployment_like_24h", "deployment_like_7d", "deployment_like_total",
         "reported_units_24h", "reported_units_7d", "reported_units_total",
+        "inferred_units_24h", "inferred_units_7d", "inferred_units_total",
         "asset_mentions_total", "last_seen_utc", "last_deployment_seen_utc",
     ]
-    deploy_ev_cols = ["dt", "asset", "title", "domain", "url", "context", "reported_units"]
+    deploy_ev_cols = ["dt", "asset", "title", "domain", "url", "context", "reported_units", "inferred_units"]
 
     if df_articles is None or df_articles.empty:
         return {
@@ -369,9 +371,11 @@ def build_signal_intelligence(df_articles: pd.DataFrame) -> dict:
     for asset, kws in REGIONAL_ASSET_PATTERNS.items():
         hit_counts = df["_text"].apply(lambda t: count_keywords_in_text(t, kws)).astype(int)
         has_asset = hit_counts > 0
-        deploy_like = has_asset & has_region_ctx & has_move_ctx
         unit_counts = df["_text"].apply(lambda t: extract_asset_quantity(t, kws)).astype(int)
+        deploy_like = has_asset & (has_move_ctx | (unit_counts > 0))
+        deploy_strict = deploy_like & has_region_ctx
         dep_units = unit_counts.where(deploy_like, 0)
+        inferred_units = dep_units.where(dep_units > 0, 1).where(deploy_like, 0)
 
         last_seen = df.loc[has_asset, "dt"].max() if has_asset.any() else pd.NaT
         last_dep_seen = df.loc[deploy_like, "dt"].max() if deploy_like.any() else pd.NaT
@@ -384,6 +388,9 @@ def build_signal_intelligence(df_articles: pd.DataFrame) -> dict:
                 "reported_units_24h": int(dep_units.where(is_24h, 0).sum()),
                 "reported_units_7d": int(dep_units.where(is_7d, 0).sum()),
                 "reported_units_total": int(dep_units.sum()),
+                "inferred_units_24h": int(inferred_units.where(is_24h, 0).sum()),
+                "inferred_units_7d": int(inferred_units.where(is_7d, 0).sum()),
+                "inferred_units_total": int(inferred_units.sum()),
                 "asset_mentions_total": int(has_asset.sum()),
                 "last_seen_utc": last_seen.strftime("%Y-%m-%d %H:%M") if pd.notna(last_seen) else "—",
                 "last_deployment_seen_utc": last_dep_seen.strftime("%Y-%m-%d %H:%M") if pd.notna(last_dep_seen) else "—",
@@ -393,8 +400,11 @@ def build_signal_intelligence(df_articles: pd.DataFrame) -> dict:
         if deploy_like.any():
             ev = df.loc[deploy_like, ["dt", "title", "domain", "url"]].copy()
             ev["asset"] = asset
-            ev["context"] = "asset + movement + region keywords"
+            ev["context"] = deploy_strict.loc[ev.index].map(
+                lambda v: "asset + movement/quantity + region" if bool(v) else "asset + movement/quantity"
+            )
             ev["reported_units"] = unit_counts.where(deploy_like, 0).loc[ev.index].astype(int)
+            ev["inferred_units"] = inferred_units.loc[ev.index].astype(int)
             dep_evidence_parts.append(ev)
 
     regional_deployments_df = pd.DataFrame(dep_rows, columns=deploy_cols).sort_values(
