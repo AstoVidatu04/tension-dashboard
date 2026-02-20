@@ -20,36 +20,55 @@ def fetch_gdelt_articles(query: str, hours_back: int, max_records: int) -> pd.Da
     if max_records > 250:
         max_records = 250
 
-    params = {
-        "query": query,
-        "mode": "ArtList",
-        "format": "json",
-        "maxrecords": max_records,
-        "formatdatetime": "true",
-        # Prefer recency so "latest topics" are actually included in the fetch.
-        "sort": "DateDesc",
-        "timespan": f"{int(hours_back)}h",
-    }
+    def _fetch_once(sort: str, limit: int) -> pd.DataFrame:
+        params = {
+            "query": query,
+            "mode": "ArtList",
+            "format": "json",
+            "maxrecords": int(limit),
+            "formatdatetime": "true",
+            "sort": sort,
+            "timespan": f"{int(hours_back)}h",
+        }
 
-    try:
-        r = requests.get(
-            GDELT_DOC_ENDPOINT,
-            params=params,
-            timeout=30,
-            headers={"User-Agent": "tension-dashboard/1.0"},
-        )
-    except requests.RequestException:
+        try:
+            r = requests.get(
+                GDELT_DOC_ENDPOINT,
+                params=params,
+                timeout=30,
+                headers={"User-Agent": "tension-dashboard/1.0"},
+            )
+        except requests.RequestException:
+            return pd.DataFrame()
+
+        if r.status_code != 200:
+            return pd.DataFrame()
+
+        data = _safe_json(r)
+        arts = data.get("articles") or []
+        if not isinstance(arts, list) or not arts:
+            return pd.DataFrame()
+        return pd.DataFrame(arts)
+
+    # Blend recency + relevancy to avoid single-day clustering that can pin scores near 50.
+    per_call = max(1, max_records // 2)
+    recent_df = _fetch_once(sort="DateDesc", limit=per_call)
+    rel_df = _fetch_once(sort="HybridRel", limit=max_records - per_call)
+
+    if recent_df.empty and rel_df.empty:
         return pd.DataFrame()
 
-    if r.status_code != 200:
-        return pd.DataFrame()
+    df = pd.concat([recent_df, rel_df], ignore_index=True) if not recent_df.empty and not rel_df.empty else (
+        recent_df if not recent_df.empty else rel_df
+    )
 
-    data = _safe_json(r)
-    arts = data.get("articles") or []
-    if not isinstance(arts, list) or not arts:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(arts)
+    # If still too concentrated in a short time span, blend with oldest records as a fallback.
+    se_probe = pd.to_datetime(df.get("seendate"), errors="coerce", utc=True)
+    unique_days = int(se_probe.dt.floor("D").nunique()) if se_probe.notna().any() else 0
+    if int(hours_back) >= 72 and unique_days < 3 and len(df) < max_records:
+        older_df = _fetch_once(sort="DateAsc", limit=max_records - len(df))
+        if not older_df.empty:
+            df = pd.concat([df, older_df], ignore_index=True)
 
     # Ensure expected columns always exist
     for col in ["url", "title", "domain", "seendate", "tone", "themes_list"]:
