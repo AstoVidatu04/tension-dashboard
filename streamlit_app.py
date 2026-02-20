@@ -10,7 +10,7 @@ import streamlit as st
 
 from config import APP_BUILD, DEFAULT_MAXRECORDS, DEFAULT_WINDOW_DAYS, DEFAULT_QUERY
 from gdelt_client import fetch_and_dedupe
-from features import build_daily_features
+from features import build_daily_features, build_signal_intelligence
 from scoring import compute_subscores, apply_diversity_multiplier
 from ui_components import risk_meter, risk_label_color
 
@@ -135,6 +135,10 @@ div_mult = source_diversity_factor(articles) if not articles.empty else 0.9
 
 daily = build_daily_features(articles)
 scored = compute_subscores(daily, smooth_days=smooth_days)
+signal_intel = build_signal_intelligence(articles)
+inventory_df = signal_intel["inventory"]
+signals_df = signal_intel["signals"]
+recent_signal_articles_df = signal_intel["recent_signal_articles"]
 
 dip_latest = float(scored["dip_score"].iloc[-1]) if len(scored) else float("nan")
 mil_latest = float(scored["mil_score"].iloc[-1]) if len(scored) else float("nan")
@@ -222,6 +226,47 @@ with tab1:
                 "A single domain dominates the feed. Reliability may be lower; "
                 "consider broadening the query or increasing max records."
             )
+
+    st.subheader("Military Buildup & Conflict Signals")
+    if articles.empty:
+        st.write("No article data available yet.")
+    else:
+        active_signals_24h = int((signals_df["articles_24h"] > 0).sum()) if not signals_df.empty else 0
+        active_inventory_7d = int((inventory_df["articles_7d"] > 0).sum()) if not inventory_df.empty else 0
+        signal_mentions_7d = int(signals_df["mentions_total"].sum()) if not signals_df.empty else 0
+
+        s1, s2, s3 = st.columns(3)
+        s1.metric("Active conflict signals (24h)", f"{active_signals_24h}")
+        s2.metric("Inventory categories seen (7d)", f"{active_inventory_7d}")
+        s3.metric("Conflict signal mentions (window)", f"{signal_mentions_7d}")
+
+        ibox, sbox = st.columns([1, 1])
+        with ibox:
+            st.caption("Inventory estimate from article mentions (not force-verified counts).")
+            st.dataframe(inventory_df, use_container_width=True, hide_index=True)
+
+        with sbox:
+            st.caption("Detected escalation/operational signals.")
+            st.dataframe(signals_df, use_container_width=True, hide_index=True)
+
+        if not signals_df.empty:
+            sig_plot = signals_df.sort_values("articles_7d", ascending=False).head(8)
+            fig_sig = px.bar(sig_plot, x="signal", y="articles_7d", title="Conflict signals seen in last 7 days")
+            fig_sig.update_layout(xaxis_title="", yaxis_title="Articles")
+            st.plotly_chart(fig_sig, use_container_width=True)
+
+        with st.expander("Recent signal evidence (latest 20 articles)"):
+            if recent_signal_articles_df.empty:
+                st.write("—")
+            else:
+                for _, row in recent_signal_articles_df.iterrows():
+                    dt = row.get("dt")
+                    dt_str = dt.strftime("%Y-%m-%d %H:%M UTC") if pd.notna(dt) else "—"
+                    title = row.get("title") or "(no title)"
+                    url = row.get("url") or ""
+                    domain = row.get("domain") or ""
+                    sigs = row.get("signals") or ""
+                    st.markdown(f"- [{title}]({url})  \\n  *{dt_str} · {domain}*  \\n  Signals: `{sigs}`")
 
     left, right = st.columns([1.35, 1])
 
