@@ -16,6 +16,23 @@ def zscore_safe(series: pd.Series) -> pd.Series:
     return (s - mu) / std
 
 
+def zscore_or_level(series: pd.Series, baseline: float, scale: float) -> pd.Series:
+    """
+    Use window z-score when there is variance.
+    If variance collapses (single day / flat window), map absolute level to a
+    pseudo-z score so indicators do not pin to 50 by construction.
+    """
+    s = pd.to_numeric(series, errors="coerce").astype(float)
+    std = float(s.std(ddof=0, skipna=True)) if len(s) else 0.0
+    if std > 1e-9 and not np.isnan(std):
+        mu = float(s.mean(skipna=True))
+        out = (s - mu) / std
+    else:
+        denom = max(float(scale), 1e-6)
+        out = (s - float(baseline)) / denom
+    return out.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+
 def logistic_0_100(x: float) -> float:
     return float(100.0 * (1.0 / (1.0 + math.exp(-x))))
 
@@ -54,13 +71,13 @@ def compute_subscores(
     d["milrate_sm"] = d["mil_rate"].rolling(window=smooth_days, min_periods=1).mean()
     d["econrate_sm"] = d["econ_rate"].rolling(window=smooth_days, min_periods=1).mean()
 
-    d["z_tone"] = zscore_safe(d["tone_sm"])
-    d["z_intent"] = zscore_safe(d["intent_sm"])
-    d["z_conflict"] = zscore_safe(d["conflict_sm"])
-    d["z_diplomacy"] = zscore_safe(d["diplomacy_sm"])
-    d["z_milrate"] = zscore_safe(d["milrate_sm"])
-    d["z_econrate"] = zscore_safe(d["econrate_sm"])
-    d["z_volume"] = zscore_safe(d["articles"].astype(float))
+    d["z_tone"] = zscore_or_level(d["tone_sm"], baseline=0.8, scale=0.8)
+    d["z_intent"] = zscore_or_level(d["intent_sm"], baseline=0.0, scale=0.08)
+    d["z_conflict"] = zscore_or_level(d["conflict_sm"], baseline=0.02, scale=0.05)
+    d["z_diplomacy"] = zscore_or_level(d["diplomacy_sm"], baseline=0.08, scale=0.08)
+    d["z_milrate"] = zscore_or_level(d["milrate_sm"], baseline=0.03, scale=0.07)
+    d["z_econrate"] = zscore_or_level(d["econrate_sm"], baseline=0.03, scale=0.07)
+    d["z_volume"] = zscore_or_level(np.log1p(d["articles"].astype(float)), baseline=2.2, scale=0.9)
 
     d["raw_dip"] = (
         cap_term(w_intent * d["z_intent"], cap_m) +

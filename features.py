@@ -33,6 +33,9 @@ def count_keywords_in_text(text: str, keywords: List[str]) -> int:
 
 
 def themes_contains_any(themes, needles: List[str]) -> bool:
+    if isinstance(themes, str):
+        # GDELT often returns semicolon/comma separated strings.
+        themes = [t.strip() for t in themes.replace(",", ";").split(";") if t.strip()]
     if not isinstance(themes, list):
         return False
     for t in themes:
@@ -109,9 +112,15 @@ def build_daily_features(df_articles: pd.DataFrame) -> pd.DataFrame:
     df["mil_hits_raw"] = text.apply(lambda t: count_keywords_in_text(t, MILITARY_KW))
     df["econ_hits_raw"] = text.apply(lambda t: count_keywords_in_text(t, ECONOMIC_KW))
 
+    themes_source = None
     if "themes_list" in df.columns:
-        df["is_diplomacy"] = df["themes_list"].apply(lambda x: 1 if themes_contains_any(x, DIPLO_THEME_NEEDLES) else 0)
-        df["is_conflict"] = df["themes_list"].apply(lambda x: 1 if themes_contains_any(x, CONFLICT_THEME_NEEDLES) else 0)
+        themes_source = df["themes_list"]
+    elif "themes" in df.columns:
+        themes_source = df["themes"]
+
+    if themes_source is not None:
+        df["is_diplomacy"] = themes_source.apply(lambda x: 1 if themes_contains_any(x, DIPLO_THEME_NEEDLES) else 0)
+        df["is_conflict"] = themes_source.apply(lambda x: 1 if themes_contains_any(x, CONFLICT_THEME_NEEDLES) else 0)
     else:
         df["is_diplomacy"] = 0
         df["is_conflict"] = 0

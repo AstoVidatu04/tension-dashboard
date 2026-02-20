@@ -75,6 +75,10 @@ def fetch_gdelt_articles(query: str, hours_back: int, max_records: int) -> pd.Da
         if col not in df.columns:
             df[col] = None
 
+    # Normalize themes: keep list form when available, otherwise carry raw themes text.
+    if "themes_list" in df.columns and "themes" in df.columns:
+        df["themes_list"] = df["themes_list"].where(df["themes_list"].notna(), df["themes"])
+
     # Parse seendate safely (handles numeric + ISO)
     sd = df["seendate"].astype(str).str.strip()
     is_num14 = sd.str.fullmatch(r"\d{14}")
