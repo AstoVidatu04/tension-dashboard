@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 import math
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 import pandas as pd
@@ -19,6 +20,39 @@ from gdelt_structured import source_diversity_factor
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def fetch_with_fallback(
+    primary_query: str,
+    fallback_queries: list[str],
+    hours_back: int,
+    max_records: int,
+    cache_prefix: str,
+    cache_key: str,
+) -> tuple[pd.DataFrame, str, bool]:
+    used_query = primary_query
+    used_fallback = False
+    df = fetch_and_dedupe(
+        query=used_query,
+        hours_back=hours_back,
+        max_records=max_records,
+        cache_key=f"{cache_prefix}-0-{cache_key}",
+    )
+    if not df.empty:
+        return df, used_query, used_fallback
+
+    for i, q in enumerate(fallback_queries, start=1):
+        df = fetch_and_dedupe(
+            query=q,
+            hours_back=hours_back,
+            max_records=max_records,
+            cache_key=f"{cache_prefix}-{i}-{cache_key}",
+        )
+        if not df.empty:
+            used_query = q
+            used_fallback = True
+            break
+    return df, used_query, used_fallback
 
 
 st.set_page_config(page_title="USA–Iran Tension Dashboard (GDELT-only)", layout="wide")
@@ -95,79 +129,61 @@ if refresh:
 
 hours_back = int(window_days) * 24
 end_dt = utc_now()
-
-with st.spinner("Fetching GDELT articles…"):
-    query_used = query
-    main_fallback_used = False
-    articles = fetch_and_dedupe(query=query_used, hours_back=hours_back, max_records=maxrecords, cache_key="main-0-" + cache_key)
-    if articles.empty:
-        for i, q in enumerate(MAIN_FALLBACK_QUERIES, start=1):
-            articles = fetch_and_dedupe(query=q, hours_back=hours_back, max_records=maxrecords, cache_key=f"main-{i}-{cache_key}")
-            if not articles.empty:
-                query_used = q
-                main_fallback_used = True
-                break
-
-with st.spinner("Fetching Pentagon pizza signal…"):
+with st.spinner("Fetching feeds (main, pizza, deployment)…"):
     pizza_hours_back = int(pizza_window_days) * 24
-    pizza_used_extended_window = False
-    pizza_query_used = pizza_query
-    pizza_fallback_used = False
-    pizza_articles = fetch_and_dedupe(
-        query=pizza_query_used,
-        hours_back=pizza_hours_back,
-        max_records=pizza_maxrecords,
-        cache_key="pizza-0-" + cache_key,
-    )
-    if pizza_articles.empty:
-        for i, q in enumerate(PIZZA_FALLBACK_QUERIES, start=1):
-            pizza_articles = fetch_and_dedupe(
-                query=q,
-                hours_back=pizza_hours_back,
-                max_records=pizza_maxrecords,
-                cache_key=f"pizza-{i}-{cache_key}",
-            )
-            if not pizza_articles.empty:
-                pizza_query_used = q
-                pizza_fallback_used = True
-                break
-    if pizza_articles.empty and pizza_window_days < 90:
-        pizza_used_extended_window = True
-        extended_hours = 90 * 24
-        for i, q in enumerate([pizza_query] + PIZZA_FALLBACK_QUERIES):
-            pizza_articles = fetch_and_dedupe(
-                query=q,
+    deployment_hours_back = int(window_days) * 24
+
+    def _fetch_main():
+        return fetch_with_fallback(
+            primary_query=query,
+            fallback_queries=MAIN_FALLBACK_QUERIES,
+            hours_back=hours_back,
+            max_records=maxrecords,
+            cache_prefix="main",
+            cache_key=cache_key,
+        )
+
+    def _fetch_deploy():
+        return fetch_with_fallback(
+            primary_query=deployment_query,
+            fallback_queries=DEPLOYMENT_FALLBACK_QUERIES,
+            hours_back=deployment_hours_back,
+            max_records=deployment_maxrecords,
+            cache_prefix="deploy",
+            cache_key=cache_key,
+        )
+
+    def _fetch_pizza():
+        pizza_df, pizza_query_used_local, pizza_fallback_used_local = fetch_with_fallback(
+            primary_query=pizza_query,
+            fallback_queries=PIZZA_FALLBACK_QUERIES,
+            hours_back=pizza_hours_back,
+            max_records=pizza_maxrecords,
+            cache_prefix="pizza",
+            cache_key=cache_key,
+        )
+        pizza_used_extended_window_local = False
+        if pizza_df.empty and pizza_window_days < 90:
+            pizza_used_extended_window_local = True
+            extended_hours = 90 * 24
+            pizza_df, pizza_query_used_local, pizza_fallback_used_local = fetch_with_fallback(
+                primary_query=pizza_query,
+                fallback_queries=PIZZA_FALLBACK_QUERIES,
                 hours_back=extended_hours,
                 max_records=pizza_maxrecords,
-                cache_key=f"pizza-extended-{i}-{cache_key}",
+                cache_prefix="pizza-extended",
+                cache_key=cache_key,
             )
-            if not pizza_articles.empty:
-                pizza_query_used = q
-                pizza_fallback_used = i > 0
-                break
+        return pizza_df, pizza_query_used_local, pizza_fallback_used_local, pizza_used_extended_window_local
 
-with st.spinner("Fetching deployment tracker signal…"):
-    deployment_hours_back = int(window_days) * 24
-    deployment_query_used = deployment_query
-    deployment_fallback_used = False
-    deployment_articles = fetch_and_dedupe(
-        query=deployment_query_used,
-        hours_back=deployment_hours_back,
-        max_records=deployment_maxrecords,
-        cache_key="deploy-0-" + cache_key,
-    )
-    if deployment_articles.empty:
-        for i, q in enumerate(DEPLOYMENT_FALLBACK_QUERIES, start=1):
-            deployment_articles = fetch_and_dedupe(
-                query=q,
-                hours_back=deployment_hours_back,
-                max_records=deployment_maxrecords,
-                cache_key=f"deploy-{i}-{cache_key}",
-            )
-            if not deployment_articles.empty:
-                deployment_query_used = q
-                deployment_fallback_used = True
-                break
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        f_main = pool.submit(_fetch_main)
+        f_deploy = pool.submit(_fetch_deploy)
+        f_pizza = pool.submit(_fetch_pizza)
+
+        articles, query_used, main_fallback_used = f_main.result()
+        deployment_articles, deployment_query_used, deployment_fallback_used = f_deploy.result()
+        pizza_articles, pizza_query_used, pizza_fallback_used, pizza_used_extended_window = f_pizza.result()
 
 data_updated_dt = end_dt
 if not articles.empty:
@@ -406,13 +422,9 @@ with tab1:
             else:
                 tmp["dt"] = pd.NaT
             latest = tmp.sort_values("dt", ascending=False).head(15)
-            for _, row in latest.iterrows():
-                dt = row.get("dt")
-                dt_str = dt.strftime("%Y-%m-%d %H:%M UTC") if pd.notna(dt) else "—"
-                title = row.get("title") or "(no title)"
-                url = row.get("url") or ""
-                domain = row.get("domain") or ""
-                st.markdown(f"- [{title}]({url})  \\n  *{dt_str} · {domain}*")
+            latest["dt"] = latest["dt"].dt.strftime("%Y-%m-%d %H:%M UTC")
+            show_cols = [c for c in ["dt", "title", "domain", "url"] if c in latest.columns]
+            st.dataframe(latest[show_cols], use_container_width=True, hide_index=True)
 
     with st.expander("Raw daily table"):
         st.dataframe(scored, use_container_width=True)
