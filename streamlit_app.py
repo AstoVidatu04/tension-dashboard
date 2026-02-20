@@ -139,6 +139,8 @@ signal_intel = build_signal_intelligence(articles)
 inventory_df = signal_intel["inventory"]
 signals_df = signal_intel["signals"]
 recent_signal_articles_df = signal_intel["recent_signal_articles"]
+regional_deployments_df = signal_intel["regional_deployments"]
+deployment_evidence_df = signal_intel["deployment_evidence"]
 
 dip_latest = float(scored["dip_score"].iloc[-1]) if len(scored) else float("nan")
 mil_latest = float(scored["mil_score"].iloc[-1]) if len(scored) else float("nan")
@@ -227,23 +229,23 @@ with tab1:
                 "consider broadening the query or increasing max records."
             )
 
-    st.subheader("Military Buildup & Conflict Signals")
+    st.subheader("Regional Military Deployment Tracker")
     if articles.empty:
         st.write("No article data available yet.")
     else:
         active_signals_24h = int((signals_df["articles_24h"] > 0).sum()) if not signals_df.empty else 0
-        active_inventory_7d = int((inventory_df["articles_7d"] > 0).sum()) if not inventory_df.empty else 0
-        signal_mentions_7d = int(signals_df["mentions_total"].sum()) if not signals_df.empty else 0
+        active_assets_7d = int((regional_deployments_df["deployment_like_7d"] > 0).sum()) if not regional_deployments_df.empty else 0
+        total_deploy_like = int(regional_deployments_df["deployment_like_total"].sum()) if not regional_deployments_df.empty else 0
 
         s1, s2, s3 = st.columns(3)
         s1.metric("Active conflict signals (24h)", f"{active_signals_24h}")
-        s2.metric("Inventory categories seen (7d)", f"{active_inventory_7d}")
-        s3.metric("Conflict signal mentions (window)", f"{signal_mentions_7d}")
+        s2.metric("Named assets with 7d deployment-like reports", f"{active_assets_7d}")
+        s3.metric("Deployment-like reports (window)", f"{total_deploy_like}")
 
-        ibox, sbox = st.columns([1, 1])
-        with ibox:
-            st.caption("Inventory estimate from article mentions (not force-verified counts).")
-            st.dataframe(inventory_df, use_container_width=True, hide_index=True)
+        dbox, sbox = st.columns([1.25, 1])
+        with dbox:
+            st.caption("Named asset inventory inferred from article text (reporting-based, not official order-of-battle).")
+            st.dataframe(regional_deployments_df, use_container_width=True, hide_index=True)
 
         with sbox:
             st.caption("Detected escalation/operational signals.")
@@ -255,7 +257,21 @@ with tab1:
             fig_sig.update_layout(xaxis_title="", yaxis_title="Articles")
             st.plotly_chart(fig_sig, use_container_width=True)
 
-        with st.expander("Recent signal evidence (latest 20 articles)"):
+        with st.expander("Deployment evidence (latest 25 deployment-like articles)"):
+            if deployment_evidence_df.empty:
+                st.write("—")
+            else:
+                for _, row in deployment_evidence_df.iterrows():
+                    dt = row.get("dt")
+                    dt_str = dt.strftime("%Y-%m-%d %H:%M UTC") if pd.notna(dt) else "—"
+                    title = row.get("title") or "(no title)"
+                    url = row.get("url") or ""
+                    domain = row.get("domain") or ""
+                    asset = row.get("asset") or ""
+                    ctx = row.get("context") or ""
+                    st.markdown(f"- [{title}]({url})  \\n  *{dt_str} · {domain}*  \\n  Asset: `{asset}` · `{ctx}`")
+
+        with st.expander("Recent conflict signal evidence (latest 20 articles)"):
             if recent_signal_articles_df.empty:
                 st.write("—")
             else:

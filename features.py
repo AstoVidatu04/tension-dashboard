@@ -32,6 +32,33 @@ CONFLICT_SIGNAL_KW = {
     "Direct clash reporting": ["exchange of fire", "airstrike", "retaliation", "cross-border strike", "casualties"],
 }
 
+DEPLOYMENT_REGION_KW = [
+    "middle east", "gulf", "persian gulf", "strait of hormuz", "red sea",
+    "arabian sea", "eastern mediterranean", "levant", "iraq", "syria",
+    "jordan", "kuwait", "qatar", "uae", "bahrain", "oman", "saudi",
+    "centcom", "al udeid", "al dhafra", "incirlik", "diego garcia",
+]
+
+DEPLOYMENT_ACTION_KW = [
+    "deploy", "deployment", "deployed", "redeploy", "reposition", "surge",
+    "sent", "dispatch", "moved", "stationed", "arrived", "transfer",
+    "forward", "reinforcement", "tasked", "to the region",
+]
+
+REGIONAL_ASSET_PATTERNS = {
+    "F-22": ["f-22", "f22", "raptor"],
+    "F-16": ["f-16", "f16", "fighting falcon"],
+    "F-35": ["f-35", "f35", "lightning ii"],
+    "B-52": ["b-52", "b52", "stratofortress"],
+    "B-1": ["b-1", "b1 lancer", "lancer bomber"],
+    "Carrier strike group": ["carrier strike group", "csg", "aircraft carrier"],
+    "Destroyers": ["destroyer", "guided-missile destroyer"],
+    "Patriot batteries": ["patriot battery", "patriot system", "patriot air defense"],
+    "THAAD": ["thaad", "terminal high altitude area defense"],
+    "Aegis ships": ["aegis", "aegis destroyer", "aegis cruiser"],
+    "Tankers/Airlift": ["kc-135", "kc-46", "c-17", "air refueling", "tanker aircraft"],
+}
+
 
 def normalize_text(s: str) -> str:
     if not isinstance(s, str):
@@ -49,6 +76,17 @@ def count_keywords_in_text(text: str, keywords: List[str]) -> int:
         if kk and kk in t:
             hits += 1
     return hits
+
+
+def contains_any_keyword(text: str, keywords: List[str]) -> bool:
+    t = normalize_text(text)
+    if not t:
+        return False
+    for k in keywords:
+        kk = k.lower()
+        if kk and kk in t:
+            return True
+    return False
 
 
 def themes_contains_any(themes, needles: List[str]) -> bool:
@@ -186,12 +224,19 @@ def build_signal_intelligence(df_articles: pd.DataFrame) -> dict:
     inventory_cols = ["category", "articles_24h", "articles_7d", "articles_total", "mentions_total"]
     signal_cols = ["signal", "articles_24h", "articles_7d", "articles_total", "mentions_total"]
     recent_cols = ["dt", "title", "domain", "url", "signals"]
+    deploy_cols = [
+        "asset", "deployment_like_24h", "deployment_like_7d", "deployment_like_total",
+        "asset_mentions_total", "last_seen_utc", "last_deployment_seen_utc",
+    ]
+    deploy_ev_cols = ["dt", "asset", "title", "domain", "url", "context"]
 
     if df_articles is None or df_articles.empty:
         return {
             "inventory": pd.DataFrame(columns=inventory_cols),
             "signals": pd.DataFrame(columns=signal_cols),
             "recent_signal_articles": pd.DataFrame(columns=recent_cols),
+            "regional_deployments": pd.DataFrame(columns=deploy_cols),
+            "deployment_evidence": pd.DataFrame(columns=deploy_ev_cols),
         }
 
     df = df_articles.copy()
@@ -257,6 +302,51 @@ def build_signal_intelligence(df_articles: pd.DataFrame) -> dict:
         ["articles_7d", "mentions_total"], ascending=False
     )
 
+    has_region_ctx = df["_text"].apply(lambda t: contains_any_keyword(t, DEPLOYMENT_REGION_KW))
+    has_move_ctx = df["_text"].apply(lambda t: contains_any_keyword(t, DEPLOYMENT_ACTION_KW))
+
+    dep_rows = []
+    dep_evidence_parts = []
+    for asset, kws in REGIONAL_ASSET_PATTERNS.items():
+        hit_counts = df["_text"].apply(lambda t: count_keywords_in_text(t, kws)).astype(int)
+        has_asset = hit_counts > 0
+        deploy_like = has_asset & has_region_ctx & has_move_ctx
+
+        last_seen = df.loc[has_asset, "dt"].max() if has_asset.any() else pd.NaT
+        last_dep_seen = df.loc[deploy_like, "dt"].max() if deploy_like.any() else pd.NaT
+        dep_rows.append(
+            {
+                "asset": asset,
+                "deployment_like_24h": int((deploy_like & is_24h).sum()),
+                "deployment_like_7d": int((deploy_like & is_7d).sum()),
+                "deployment_like_total": int(deploy_like.sum()),
+                "asset_mentions_total": int(has_asset.sum()),
+                "last_seen_utc": last_seen.strftime("%Y-%m-%d %H:%M") if pd.notna(last_seen) else "—",
+                "last_deployment_seen_utc": last_dep_seen.strftime("%Y-%m-%d %H:%M") if pd.notna(last_dep_seen) else "—",
+            }
+        )
+
+        if deploy_like.any():
+            ev = df.loc[deploy_like, ["dt", "title", "domain", "url"]].copy()
+            ev["asset"] = asset
+            ev["context"] = "asset + movement + region keywords"
+            dep_evidence_parts.append(ev)
+
+    regional_deployments_df = pd.DataFrame(dep_rows, columns=deploy_cols).sort_values(
+        ["deployment_like_7d", "deployment_like_total", "asset_mentions_total"],
+        ascending=False,
+    )
+
+    if dep_evidence_parts:
+        deployment_evidence_df = (
+            pd.concat(dep_evidence_parts, ignore_index=True)
+            .sort_values("dt", ascending=False)[deploy_ev_cols]
+            .head(25)
+            .reset_index(drop=True)
+        )
+    else:
+        deployment_evidence_df = pd.DataFrame(columns=deploy_ev_cols)
+
     def _signals_for_row(row: pd.Series) -> str:
         active = []
         for sig in CONFLICT_SIGNAL_KW.keys():
@@ -285,4 +375,6 @@ def build_signal_intelligence(df_articles: pd.DataFrame) -> dict:
         "inventory": inventory_df.reset_index(drop=True),
         "signals": signal_df.reset_index(drop=True),
         "recent_signal_articles": recent_signal_articles,
+        "regional_deployments": regional_deployments_df.reset_index(drop=True),
+        "deployment_evidence": deployment_evidence_df,
     }
