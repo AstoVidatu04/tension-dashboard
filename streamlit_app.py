@@ -47,6 +47,10 @@ DEPLOYMENT_FALLBACK_QUERIES = [
     '("F-22" OR F22 OR "F-16" OR F16 OR "F-35" OR F35 OR Patriot OR THAAD OR Aegis '
     'OR destroyer OR "carrier strike group")',
 ]
+MAIN_FALLBACK_QUERIES = [
+    '(United States OR Pentagon OR CENTCOM OR "U.S.") (Iran OR Tehran OR IRGC)',
+    '(US OR "United States") (Iran) (military OR strike OR missile OR sanctions)',
+]
 PIZZA_FALLBACK_QUERIES = [
     '(pizza OR pizzeria OR "pizza delivery" OR "dominos" OR "papa john") '
     '(Pentagon OR Arlington OR Alexandria OR "Northern Virginia" OR "Washington")',
@@ -93,7 +97,16 @@ hours_back = int(window_days) * 24
 end_dt = utc_now()
 
 with st.spinner("Fetching GDELT articles…"):
-    articles = fetch_and_dedupe(query=query, hours_back=hours_back, max_records=maxrecords, cache_key=cache_key)
+    query_used = query
+    main_fallback_used = False
+    articles = fetch_and_dedupe(query=query_used, hours_back=hours_back, max_records=maxrecords, cache_key="main-0-" + cache_key)
+    if articles.empty:
+        for i, q in enumerate(MAIN_FALLBACK_QUERIES, start=1):
+            articles = fetch_and_dedupe(query=q, hours_back=hours_back, max_records=maxrecords, cache_key=f"main-{i}-{cache_key}")
+            if not articles.empty:
+                query_used = q
+                main_fallback_used = True
+                break
 
 with st.spinner("Fetching Pentagon pizza signal…"):
     pizza_hours_back = int(pizza_window_days) * 24
@@ -217,6 +230,9 @@ with tab1:
         "GDELT cached (~15 minutes). Scores: Diplomatic, Military, Economic + composite. "
         "Source diversity adjusts confidence for composite only."
     )
+    st.caption(f"Main query used: `{query_used}`")
+    if main_fallback_used:
+        st.caption("Main query fallback in use.")
 
     st.subheader("Pentagon Pizza Index")
     p1, p2 = st.columns([1.2, 1])
@@ -269,7 +285,7 @@ with tab1:
             )
 
     st.subheader("Regional Military Deployment Tracker")
-    if articles.empty:
+    if deployment_articles.empty and articles.empty:
         st.write("No article data available yet.")
     else:
         active_signals_24h = int((signals_df["articles_24h"] > 0).sum()) if not signals_df.empty else 0
