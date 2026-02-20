@@ -35,6 +35,18 @@ DEFAULT_PIZZA_QUERY = (
     '(pizza OR pizzeria OR "pizza delivery") '
     '(Pentagon OR Arlington OR "Washington DC" OR "National Capital Region")'
 )
+DEFAULT_DEPLOYMENT_QUERY = (
+    '("F-22" OR F22 OR "F-16" OR F16 OR "F-35" OR F35 OR "B-52" OR "B-1" '
+    'OR "carrier strike group" OR destroyer OR Patriot OR THAAD OR Aegis OR "KC-46" OR "C-17") '
+    '(deploy OR deployed OR redeploy OR sent OR dispatch OR reposition OR surge OR moved) '
+    '("Middle East" OR CENTCOM OR Gulf OR Qatar OR Bahrain OR Kuwait OR UAE OR Iraq OR Syria OR "Red Sea")'
+)
+DEPLOYMENT_FALLBACK_QUERIES = [
+    '("F-22" OR F22 OR "F-16" OR F16 OR "F-35" OR F35 OR "B-52" OR "B-1" OR Patriot OR THAAD '
+    'OR Aegis OR destroyer OR "carrier strike group") ("Middle East" OR CENTCOM OR Gulf)',
+    '("F-22" OR F22 OR "F-16" OR F16 OR "F-35" OR F35 OR Patriot OR THAAD OR Aegis '
+    'OR destroyer OR "carrier strike group")',
+]
 PIZZA_FALLBACK_QUERIES = [
     '(pizza OR pizzeria OR "pizza delivery" OR "dominos" OR "papa john") '
     '(Pentagon OR Arlington OR Alexandria OR "Northern Virginia" OR "Washington")',
@@ -52,6 +64,10 @@ with st.sidebar:
     pizza_query = st.text_input("Pizza query", value=DEFAULT_PIZZA_QUERY)
     pizza_window_days = st.slider("Pizza lookback (days)", 7, 90, 30)
     pizza_maxrecords = st.slider("Pizza max records", 50, 250, 150, step=25)
+
+    st.header("Deployment Tracker")
+    deployment_query = st.text_input("Deployment query", value=DEFAULT_DEPLOYMENT_QUERY)
+    deployment_maxrecords = st.slider("Deployment max records", 50, 250, 200, step=25)
 
     st.header("Scoring")
     smooth_days = st.slider("Smoothing (days)", 1, 14, 3)
@@ -117,6 +133,29 @@ with st.spinner("Fetching Pentagon pizza signal…"):
                 pizza_fallback_used = i > 0
                 break
 
+with st.spinner("Fetching deployment tracker signal…"):
+    deployment_hours_back = int(window_days) * 24
+    deployment_query_used = deployment_query
+    deployment_fallback_used = False
+    deployment_articles = fetch_and_dedupe(
+        query=deployment_query_used,
+        hours_back=deployment_hours_back,
+        max_records=deployment_maxrecords,
+        cache_key="deploy-0-" + cache_key,
+    )
+    if deployment_articles.empty:
+        for i, q in enumerate(DEPLOYMENT_FALLBACK_QUERIES, start=1):
+            deployment_articles = fetch_and_dedupe(
+                query=q,
+                hours_back=deployment_hours_back,
+                max_records=deployment_maxrecords,
+                cache_key=f"deploy-{i}-{cache_key}",
+            )
+            if not deployment_articles.empty:
+                deployment_query_used = q
+                deployment_fallback_used = True
+                break
+
 data_updated_dt = end_dt
 if not articles.empty:
     if "seendate" in articles.columns:
@@ -135,7 +174,7 @@ div_mult = source_diversity_factor(articles) if not articles.empty else 0.9
 
 daily = build_daily_features(articles)
 scored = compute_subscores(daily, smooth_days=smooth_days)
-signal_intel = build_signal_intelligence(articles)
+signal_intel = build_signal_intelligence(deployment_articles if not deployment_articles.empty else articles)
 inventory_df = signal_intel["inventory"]
 signals_df = signal_intel["signals"]
 recent_signal_articles_df = signal_intel["recent_signal_articles"]
@@ -241,6 +280,10 @@ with tab1:
         s1.metric("Active conflict signals (24h)", f"{active_signals_24h}")
         s2.metric("Named assets with 7d deployment-like reports", f"{active_assets_7d}")
         s3.metric("Deployment-like reports (window)", f"{total_deploy_like}")
+        st.caption(f"Deployment tracker articles (deduped): {len(deployment_articles)}")
+        st.caption(f"Deployment query used: `{deployment_query_used}`")
+        if deployment_fallback_used:
+            st.caption("Deployment fallback query in use.")
 
         dbox, sbox = st.columns([1.25, 1])
         with dbox:
