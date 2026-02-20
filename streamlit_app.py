@@ -35,6 +35,12 @@ DEFAULT_PIZZA_QUERY = (
     '(pizza OR pizzeria OR "pizza delivery") '
     '(Pentagon OR Arlington OR "Washington DC" OR "National Capital Region")'
 )
+PIZZA_FALLBACK_QUERIES = [
+    '(pizza OR pizzeria OR "pizza delivery" OR "dominos" OR "papa john") '
+    '(Pentagon OR Arlington OR Alexandria OR "Northern Virginia" OR "Washington")',
+    '(pizza OR pizzeria OR "pizza delivery" OR "late-night food") '
+    '(Arlington OR Pentagon)',
+]
 
 with st.sidebar:
     st.header("GDELT")
@@ -75,12 +81,41 @@ with st.spinner("Fetching GDELT articles…"):
 
 with st.spinner("Fetching Pentagon pizza signal…"):
     pizza_hours_back = int(pizza_window_days) * 24
+    pizza_used_extended_window = False
+    pizza_query_used = pizza_query
+    pizza_fallback_used = False
     pizza_articles = fetch_and_dedupe(
-        query=pizza_query,
+        query=pizza_query_used,
         hours_back=pizza_hours_back,
         max_records=pizza_maxrecords,
-        cache_key="pizza-" + cache_key,
+        cache_key="pizza-0-" + cache_key,
     )
+    if pizza_articles.empty:
+        for i, q in enumerate(PIZZA_FALLBACK_QUERIES, start=1):
+            pizza_articles = fetch_and_dedupe(
+                query=q,
+                hours_back=pizza_hours_back,
+                max_records=pizza_maxrecords,
+                cache_key=f"pizza-{i}-{cache_key}",
+            )
+            if not pizza_articles.empty:
+                pizza_query_used = q
+                pizza_fallback_used = True
+                break
+    if pizza_articles.empty and pizza_window_days < 90:
+        pizza_used_extended_window = True
+        extended_hours = 90 * 24
+        for i, q in enumerate([pizza_query] + PIZZA_FALLBACK_QUERIES):
+            pizza_articles = fetch_and_dedupe(
+                query=q,
+                hours_back=extended_hours,
+                max_records=pizza_maxrecords,
+                cache_key=f"pizza-extended-{i}-{cache_key}",
+            )
+            if not pizza_articles.empty:
+                pizza_query_used = q
+                pizza_fallback_used = i > 0
+                break
 
 data_updated_dt = end_dt
 if not articles.empty:
@@ -143,6 +178,12 @@ with tab1:
     p1.plotly_chart(risk_meter(pizza_latest, "Pizza alarm"), use_container_width=True)
     p2.metric("Status", pizza_status(pizza_latest))
     p2.metric("Pizza articles (deduped)", f"{len(pizza_articles)}")
+    if pizza_fallback_used:
+        p2.caption("Pizza fallback query in use.")
+    if pizza_used_extended_window:
+        p2.caption("Pizza lookback auto-extended to 90 days.")
+    if pizza_articles.empty:
+        p2.caption("No matches across default + fallback pizza queries.")
 
     c1, c2, c3, c4, c5 = st.columns([1.1, 1.1, 1.1, 1, 1])
     c1.plotly_chart(risk_meter(dip_latest, "Diplomatic risk"), use_container_width=True)
