@@ -187,7 +187,10 @@ div_mult = source_diversity_factor(articles) if not articles.empty else 0.9
 
 daily = build_daily_features(articles)
 scored = compute_subscores(daily, smooth_days=smooth_days)
-signal_intel = build_signal_intelligence(deployment_articles if not deployment_articles.empty else articles)
+signal_intel = build_signal_intelligence(
+    deployment_articles if not deployment_articles.empty else articles,
+    assume_deployment_context=not deployment_articles.empty,
+)
 inventory_df = signal_intel["inventory"]
 signals_df = signal_intel["signals"]
 recent_signal_articles_df = signal_intel["recent_signal_articles"]
@@ -304,6 +307,8 @@ with tab1:
         st.caption(f"Deployment query used: `{deployment_query_used}`")
         if deployment_fallback_used:
             st.caption("Deployment fallback query in use.")
+        if not deployment_articles.empty:
+            st.caption("Deployment context mode: asset mentions in this feed are treated as deployment-like signals.")
 
         dbox, sbox = st.columns([1.25, 1])
         with dbox:

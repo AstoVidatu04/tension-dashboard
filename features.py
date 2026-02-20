@@ -279,7 +279,7 @@ def build_daily_features(df_articles: pd.DataFrame) -> pd.DataFrame:
     return daily
 
 
-def build_signal_intelligence(df_articles: pd.DataFrame) -> dict:
+def build_signal_intelligence(df_articles: pd.DataFrame, assume_deployment_context: bool = False) -> dict:
     inventory_cols = ["category", "articles_24h", "articles_7d", "articles_total", "mentions_total"]
     signal_cols = ["signal", "articles_24h", "articles_7d", "articles_total", "mentions_total"]
     recent_cols = ["dt", "title", "domain", "url", "signals"]
@@ -372,7 +372,7 @@ def build_signal_intelligence(df_articles: pd.DataFrame) -> dict:
         hit_counts = df["_text"].apply(lambda t: count_keywords_in_text(t, kws)).astype(int)
         has_asset = hit_counts > 0
         unit_counts = df["_text"].apply(lambda t: extract_asset_quantity(t, kws)).astype(int)
-        deploy_like = has_asset & (has_move_ctx | (unit_counts > 0))
+        deploy_like = has_asset & (has_move_ctx | (unit_counts > 0) | bool(assume_deployment_context))
         deploy_strict = deploy_like & has_region_ctx
         dep_units = unit_counts.where(deploy_like, 0)
         inferred_units = dep_units.where(dep_units > 0, 1).where(deploy_like, 0)
