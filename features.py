@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import numpy as np
 import pandas as pd
 from typing import List
@@ -56,7 +57,26 @@ REGIONAL_ASSET_PATTERNS = {
     "Patriot batteries": ["patriot battery", "patriot system", "patriot air defense"],
     "THAAD": ["thaad", "terminal high altitude area defense"],
     "Aegis ships": ["aegis", "aegis destroyer", "aegis cruiser"],
-    "Tankers/Airlift": ["kc-135", "kc-46", "c-17", "air refueling", "tanker aircraft"],
+    "KC-135 tankers": ["kc-135", "kc135", "stratotanker"],
+    "KC-46 tankers": ["kc-46", "kc46", "pegasus tanker"],
+    "Aerial tankers (generic)": ["tanker aircraft", "air refueling tanker", "refuelling tanker", "aerial tanker"],
+    "C-17 airlift": ["c-17", "c17 globemaster", "globemaster"],
+}
+
+NUMBER_WORDS = {
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+    "eleven": 11,
+    "twelve": 12,
+    "dozen": 12,
 }
 
 
@@ -87,6 +107,44 @@ def contains_any_keyword(text: str, keywords: List[str]) -> bool:
         if kk and kk in t:
             return True
     return False
+
+
+def _word_to_int(token: str) -> int:
+    t = normalize_text(token)
+    if not t:
+        return 0
+    if t.isdigit():
+        return int(t)
+    return int(NUMBER_WORDS.get(t, 0))
+
+
+def extract_asset_quantity(text: str, asset_keywords: List[str]) -> int:
+    """
+    Extract explicit reported quantity for an asset from one article text.
+    Uses nearby patterns such as:
+    - "12 F-16"
+    - "F-35 ... 8"
+    - "a dozen F-22"
+    Returns 0 when no explicit count is found.
+    """
+    t = normalize_text(text)
+    if not t:
+        return 0
+
+    best = 0
+    for kw in asset_keywords:
+        k = re.escape(normalize_text(kw))
+        patterns = [
+            rf"\b(\d{{1,3}})\s+(?:additional\s+|more\s+)?{k}s?\b",
+            rf"\b(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|dozen)\s+{k}s?\b",
+            rf"\b{k}s?\b[^0-9a-z]{{0,12}}(\d{{1,3}})\b",
+        ]
+        for p in patterns:
+            for m in re.finditer(p, t):
+                v = _word_to_int(m.group(1))
+                if v > best:
+                    best = v
+    return best
 
 
 def themes_contains_any(themes, needles: List[str]) -> bool:
@@ -226,9 +284,10 @@ def build_signal_intelligence(df_articles: pd.DataFrame) -> dict:
     recent_cols = ["dt", "title", "domain", "url", "signals"]
     deploy_cols = [
         "asset", "deployment_like_24h", "deployment_like_7d", "deployment_like_total",
+        "reported_units_24h", "reported_units_7d", "reported_units_total",
         "asset_mentions_total", "last_seen_utc", "last_deployment_seen_utc",
     ]
-    deploy_ev_cols = ["dt", "asset", "title", "domain", "url", "context"]
+    deploy_ev_cols = ["dt", "asset", "title", "domain", "url", "context", "reported_units"]
 
     if df_articles is None or df_articles.empty:
         return {
@@ -311,6 +370,8 @@ def build_signal_intelligence(df_articles: pd.DataFrame) -> dict:
         hit_counts = df["_text"].apply(lambda t: count_keywords_in_text(t, kws)).astype(int)
         has_asset = hit_counts > 0
         deploy_like = has_asset & has_region_ctx & has_move_ctx
+        unit_counts = df["_text"].apply(lambda t: extract_asset_quantity(t, kws)).astype(int)
+        dep_units = unit_counts.where(deploy_like, 0)
 
         last_seen = df.loc[has_asset, "dt"].max() if has_asset.any() else pd.NaT
         last_dep_seen = df.loc[deploy_like, "dt"].max() if deploy_like.any() else pd.NaT
@@ -320,6 +381,9 @@ def build_signal_intelligence(df_articles: pd.DataFrame) -> dict:
                 "deployment_like_24h": int((deploy_like & is_24h).sum()),
                 "deployment_like_7d": int((deploy_like & is_7d).sum()),
                 "deployment_like_total": int(deploy_like.sum()),
+                "reported_units_24h": int(dep_units.where(is_24h, 0).sum()),
+                "reported_units_7d": int(dep_units.where(is_7d, 0).sum()),
+                "reported_units_total": int(dep_units.sum()),
                 "asset_mentions_total": int(has_asset.sum()),
                 "last_seen_utc": last_seen.strftime("%Y-%m-%d %H:%M") if pd.notna(last_seen) else "—",
                 "last_deployment_seen_utc": last_dep_seen.strftime("%Y-%m-%d %H:%M") if pd.notna(last_dep_seen) else "—",
@@ -330,6 +394,7 @@ def build_signal_intelligence(df_articles: pd.DataFrame) -> dict:
             ev = df.loc[deploy_like, ["dt", "title", "domain", "url"]].copy()
             ev["asset"] = asset
             ev["context"] = "asset + movement + region keywords"
+            ev["reported_units"] = unit_counts.where(deploy_like, 0).loc[ev.index].astype(int)
             dep_evidence_parts.append(ev)
 
     regional_deployments_df = pd.DataFrame(dep_rows, columns=deploy_cols).sort_values(
@@ -340,10 +405,13 @@ def build_signal_intelligence(df_articles: pd.DataFrame) -> dict:
     if dep_evidence_parts:
         deployment_evidence_df = (
             pd.concat(dep_evidence_parts, ignore_index=True)
-            .sort_values("dt", ascending=False)[deploy_ev_cols]
+            .sort_values("dt", ascending=False)
             .head(25)
             .reset_index(drop=True)
         )
+        if "reported_units" not in deployment_evidence_df.columns:
+            deployment_evidence_df["reported_units"] = 0
+        deployment_evidence_df = deployment_evidence_df[deploy_ev_cols]
     else:
         deployment_evidence_df = pd.DataFrame(columns=deploy_ev_cols)
 

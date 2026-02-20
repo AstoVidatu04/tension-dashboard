@@ -275,11 +275,13 @@ with tab1:
         active_signals_24h = int((signals_df["articles_24h"] > 0).sum()) if not signals_df.empty else 0
         active_assets_7d = int((regional_deployments_df["deployment_like_7d"] > 0).sum()) if not regional_deployments_df.empty else 0
         total_deploy_like = int(regional_deployments_df["deployment_like_total"].sum()) if not regional_deployments_df.empty else 0
+        total_reported_units = int(regional_deployments_df["reported_units_total"].sum()) if not regional_deployments_df.empty else 0
 
         s1, s2, s3 = st.columns(3)
         s1.metric("Active conflict signals (24h)", f"{active_signals_24h}")
         s2.metric("Named assets with 7d deployment-like reports", f"{active_assets_7d}")
-        s3.metric("Deployment-like reports (window)", f"{total_deploy_like}")
+        s3.metric("Reported deployed units (window)", f"{total_reported_units}")
+        st.caption(f"Deployment-like reports (window): {total_deploy_like}")
         st.caption(f"Deployment tracker articles (deduped): {len(deployment_articles)}")
         st.caption(f"Deployment query used: `{deployment_query_used}`")
         if deployment_fallback_used:
@@ -287,8 +289,12 @@ with tab1:
 
         dbox, sbox = st.columns([1.25, 1])
         with dbox:
-            st.caption("Named asset inventory inferred from article text (reporting-based, not official order-of-battle).")
-            st.dataframe(regional_deployments_df, use_container_width=True, hide_index=True)
+            st.caption("Named asset inventory inferred from article text. Counts are extracted only when explicit quantities are reported.")
+            deploy_view = regional_deployments_df.sort_values(
+                ["reported_units_7d", "reported_units_total", "deployment_like_7d"],
+                ascending=False,
+            )
+            st.dataframe(deploy_view, use_container_width=True, hide_index=True)
 
         with sbox:
             st.caption("Detected escalation/operational signals.")
@@ -312,7 +318,11 @@ with tab1:
                     domain = row.get("domain") or ""
                     asset = row.get("asset") or ""
                     ctx = row.get("context") or ""
-                    st.markdown(f"- [{title}]({url})  \\n  *{dt_str} · {domain}*  \\n  Asset: `{asset}` · `{ctx}`")
+                    units = int(row.get("reported_units", 0) or 0)
+                    st.markdown(
+                        f"- [{title}]({url})  \\n  *{dt_str} · {domain}*  \\n  "
+                        f"Asset: `{asset}` · reported units: `{units}` · `{ctx}`"
+                    )
 
         with st.expander("Recent conflict signal evidence (latest 20 articles)"):
             if recent_signal_articles_df.empty:
